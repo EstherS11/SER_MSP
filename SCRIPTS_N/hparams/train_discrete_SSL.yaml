@@ -1,0 +1,246 @@
+# ########################################
+# Ultimate Recipe for MSP-PODCAST Emotion Recognition (Multi-class)
+# Updated for 10 emotion classes with macro-F1 evaluation
+# Discrete SSL + ECAPA-TDNN with hybrid attention
+# Authors: [Your Name] 
+# ########################################
+
+# Seed needs to be set at top of yaml
+seed: 1986
+__set_seed: !apply:torch.manual_seed [!ref <seed>]
+
+# Dataset configuration
+data_folder: !PLACEHOLDER # Directory containing JSON files (use "." for current)
+output_folder: !ref results/MSP_PODCAST/ultimate_discrete_ssl/<ssl_model_type>/<attention_mode>/<seed>
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+
+### SSL Model Configuration (Based on DASB best practices)
+# Recommended: wavlm (best performance according to DASB)
+ssl_model_type: wavlm  # Options: hubert, wavlm, wav2vec2
+ssl_hub: microsoft/wavlm-large
+ssl_folder: !ref <save_folder>/ssl_checkpoint
+
+# Pre-trained K-means (IEMOCAP approach - no training needed!)
+kmeans_repo_id: speechbrain/SSL_Quantization
+kmeans_cache_dir: !ref <save_folder>/kmeans_checkpoint
+kmeans_dataset: LibriSpeech-100-360-500
+freeze_ssl: True
+freeze_feature_extractor: True
+num_clusters: 1000
+
+### Tokenizer Configuration (IEMOCAP proven layers)
+ssl_layer_num: [1, 3, 7, 12, 18, 23]  # Optimal layer combination from IEMOCAP
+num_codebooks: 6
+deduplicate: [False, False, False, False, False, False]
+bpe_tokenizer_path: [null, null, null, null, null, null]
+sample_rate: 16000
+
+### Model Architecture Configuration
+encoder_dim: 1024
+
+# Ultimate Model Settings
+attention_mode: hybrid  # Options: 'iemocap', 'advanced', 'hybrid'
+use_positional_encoding: True   # Enhanced temporal modeling
+use_global_priors: True         # Learnable codebook importance
+use_layer_norm: True           # Better training stability
+dropout_rate: 0.1              # Regularization
+
+# MSP-PODCAST Multi-class Settings (UPDATED!)
+different_speakers: False  # Use original Train/Dev/Test split
+use_original_split: True
+test_set_choice: 'both'    # Use both Test1 and Test2
+
+# MSP-PODCAST 10-class emotion configuration
+out_n_neurons: 10  # N, H, X, A, S, U, C, O, D, F (instead of 4)
+
+# Emotion class mapping for MSP-PODCAST (10 classes)
+emotion_classes: ['N', 'H', 'X', 'A', 'S', 'U', 'C', 'O', 'D', 'F']
+emotion_names: ['Neutral', 'Happy', 'Excited', 'Angry', 'Sad', 'Surprised', 'Contempt', 'Other', 'Disgusted', 'Fear']
+
+# Class weights for imbalanced data (optional)
+use_class_weights: True
+class_weights: [1.0, 1.5, 1.8, 3.5, 3.7, 10.3, 12.8, 19.8, 24.0, 30.7]  # Inverse frequency weights
+
+# Evaluation metrics configuration (NEW!)
+eval_metrics:
+    primary_metric: 'macro_f1'        # Primary metric for model selection
+    additional_metrics: ['accuracy', 'weighted_f1', 'macro_recall', 'macro_precision']
+    compute_per_class: True           # Compute per-class metrics
+    compute_confusion_matrix: True    # Generate confusion matrix
+
+# Data paths
+train_annotation: !ref <data_folder>/msp_train_minimal.json
+valid_annotation: !ref <data_folder>/msp_valid_minimal.json
+test_annotation: !ref <data_folder>/msp_test_minimal.json
+skip_prep: True
+
+### Training Configuration
+precision: fp32
+number_of_epochs: 30
+batch_size: 8           # Increased for multi-class stability
+test_batch_size: 4
+lr: 0.0002             # IEMOCAP proven learning rate
+
+# Learning rate scheduling with macro-F1 (instead of error rate)
+lr_scheduling_metric: 'macro_f1'
+lr_scheduling_mode: 'max'  # Maximize macro-F1 (vs minimize error)
+
+### Dataloader Settings
+train_dataloader_opts:
+    batch_size: !ref <batch_size>
+    shuffle: True
+    num_workers: 2
+    drop_last: False
+
+valid_dataloader_opts:
+    batch_size: !ref <batch_size>
+
+test_dataloader_opts:
+    batch_size: !ref <test_batch_size>
+
+### Advanced Configuration Options
+# Model selection based on SSL type
+ssl_model: !apply:speechbrain.utils.hparams.choice
+    value: !ref <ssl_model_type>
+    choices:
+        wavlm: !new:speechbrain.lobes.models.huggingface_transformers.wavlm.WavLM
+            source: !ref <ssl_hub>
+            output_norm: False
+            freeze: !ref <freeze_ssl>
+            freeze_feature_extractor: !ref <freeze_feature_extractor>
+            output_all_hiddens: True
+            save_path: !ref <ssl_folder>
+        hubert: !new:speechbrain.lobes.models.huggingface_transformers.hubert.HuBERT
+            source: facebook/hubert-large-ll60k
+            output_norm: False
+            freeze: !ref <freeze_ssl>
+            freeze_feature_extractor: !ref <freeze_feature_extractor>
+            output_all_hiddens: True
+            save_path: !ref <ssl_folder>
+        wav2vec2: !new:speechbrain.lobes.models.huggingface_transformers.wav2vec2.Wav2Vec2
+            source: facebook/wav2vec2-large
+            output_norm: False
+            freeze: !ref <freeze_ssl>
+            freeze_feature_extractor: !ref <freeze_feature_extractor>
+            output_all_hiddens: True
+            save_path: !ref <ssl_folder>
+
+# Discrete SSL Codec
+codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.DiscreteSSL
+    save_path: !ref <kmeans_cache_dir>
+    ssl_model: !ref <ssl_model>
+    kmeans_dataset: !ref <kmeans_dataset>
+    kmeans_repo_id: !ref <kmeans_repo_id>
+    num_clusters: !ref <num_clusters>
+
+# Ultimate Discrete Embedding (IEMOCAP + enhancements)
+discrete_embedding_layer: !new:custom_model.Discrete_EmbeddingLayer
+    num_codebooks: !ref <num_codebooks>
+    vocab_size: !ref <num_clusters>
+    emb_dim: !ref <encoder_dim>
+    use_positional_encoding: !ref <use_positional_encoding>
+    init_method: 'xavier'
+    freeze: False
+
+# Hybrid Attention MLP (Best of both worlds)
+attention_mlp: !new:custom_model.AttentionMLP
+    input_dim: !ref <encoder_dim>
+    hidden_dim: !ref <encoder_dim>
+    num_codebooks: !ref <num_codebooks>
+    mode: !ref <attention_mode>
+    dropout_rate: !ref <dropout_rate>
+    use_layer_norm: !ref <use_layer_norm>
+    use_global_priors: !ref <use_global_priors>
+
+# ECAPA-TDNN Backbone (IEMOCAP proven configuration)
+embedding_model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
+    input_size: !ref <encoder_dim>
+    channels: [1024, 1024, 1024, 1024, 3072]
+    kernel_sizes: [5, 3, 3, 3, 1]
+    dilations: [1, 2, 3, 4, 1]
+    attention_channels: 64
+    lin_neurons: 192
+
+# Final Classifier (Updated for 10 classes)
+classifier: !new:speechbrain.lobes.models.ECAPA_TDNN.Classifier
+    input_size: 192
+    out_neurons: !ref <out_n_neurons>
+
+### Training Components
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+# Tokenizer configuration
+tokenizer_config:
+    SSL_layers: !ref <ssl_layer_num>
+    deduplicates: !ref <deduplicate>
+    bpe_tokenizers: !ref <bpe_tokenizer_path>
+
+# Module registration
+modules:
+    classifier: !ref <classifier>
+    embedding_model: !ref <embedding_model>
+    attention_mlp: !ref <attention_mlp>
+    codec: !ref <codec>
+    discrete_embedding_layer: !ref <discrete_embedding_layer>
+
+model: !new:torch.nn.ModuleList
+    - [!ref <embedding_model>, !ref <classifier>, !ref <discrete_embedding_layer>, !ref <attention_mlp>]
+
+### Loss and Optimization
+log_softmax: !new:speechbrain.nnet.activations.Softmax
+    apply_log: True
+
+# Loss function with optional class weights
+compute_cost: !name:speechbrain.nnet.losses.nll_loss
+
+# Multi-class evaluation metrics (NEW!)
+error_stats: !name:custom_model.MultiClassMetrics
+    num_classes: !ref <out_n_neurons>
+    class_names: !ref <emotion_classes>
+    primary_metric: !ref <eval_metrics>["primary_metric"]
+    additional_metrics: !ref <eval_metrics>["additional_metrics"]
+
+# Optimizer (IEMOCAP proven)
+model_opt_class: !name:torch.optim.Adam
+    lr: !ref <lr>
+
+# Learning rate scheduling (Updated for macro-F1)
+lr_annealing_model: !new:speechbrain.nnet.schedulers.ReduceLROnPlateau
+    factor: 0.5
+    patience: 3
+    mode: !ref <lr_scheduling_mode>
+    verbose: True
+
+### Logging and Checkpointing
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+ckpt_interval_minutes: 15
+
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        model: !ref <model>
+        scheduler_model: !ref <lr_annealing_model>
+        attention_mlp: !ref <attention_mlp>
+        codec: !ref <codec>
+        discrete_embedding_layer: !ref <discrete_embedding_layer>
+        classifier: !ref <classifier>
+        counter: !ref <epoch_counter>
+
+### Experimental Configurations for Multi-class
+
+# For initial testing (10-class is more challenging):
+# batch_size: 4
+# number_of_epochs: 50
+# lr: 0.0001
+
+# For fast convergence:
+# use_class_weights: True
+# lr_annealing_patience: 2
+
+# For detailed analysis:
+# eval_metrics.compute_per_class: True
+# eval_metrics.compute_confusion_matrix: True
