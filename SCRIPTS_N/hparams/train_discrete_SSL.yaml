@@ -70,9 +70,9 @@ eval_metrics:
     compute_confusion_matrix: True    # Generate confusion matrix
 
 # Data paths
-train_annotation: !ref <data_folder>/msp_train_minimal.json
-valid_annotation: !ref <data_folder>/msp_valid_minimal.json
-test_annotation: !ref <data_folder>/msp_test_minimal.json
+train_annotation: !ref <data_folder>/msp_train_10class.json
+valid_annotation: !ref <data_folder>/msp_valid_10class.json
+test_annotation: !ref <data_folder>/msp_test_10class.json
 skip_prep: True
 
 ### Training Configuration
