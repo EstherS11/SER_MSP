@@ -409,12 +409,23 @@ def dataio_prepare(hparams):
         "test": hparams["test_annotation"],
     }
     
+    # 修正：确保正确使用 data_pipeline 装饰器
+    @sb.utils.data_pipeline.takes("wav")
+    @sb.utils.data_pipeline.provides("sig")
+    def audio_pipeline_decorated(wav):
+        return audio_pipeline(wav)
+    
+    @sb.utils.data_pipeline.takes("emo")
+    @sb.utils.data_pipeline.provides("emo_id")
+    def label_pipeline_decorated(emo):
+        return label_pipeline(emo)
+    
     for dataset in data_info:
         logger.info(f"Loading {dataset} dataset...")
         datasets[dataset] = sb.dataio.dataset.DynamicItemDataset.from_json(
             json_path=data_info[dataset],
             replacements={"data_root": hparams["data_folder"]},
-            dynamic_items=[audio_pipeline, label_pipeline],
+            dynamic_items=[audio_pipeline_decorated, label_pipeline_decorated],
             output_keys=["id", "sig", "emo_id"],
         )
         logger.info(f"{dataset} dataset size: {len(datasets[dataset])}")
