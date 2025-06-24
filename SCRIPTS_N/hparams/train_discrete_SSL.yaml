@@ -1,16 +1,14 @@
-# ########################################
-# Ultimate Recipe for MSP-PODCAST Emotion Recognition (Multi-class)
-# Updated for 10 emotion classes with macro-F1 evaluation
-# Discrete SSL + ECAPA-TDNN with hybrid attention
-# Authors: [Your Name] 
-# ########################################
+# ################################
+# Ultimate MSP-PODCAST Discrete SSL Training Configuration
+# Supports: WavLM, HuBERT, Wav2Vec2
+# Optimized for emotion recognition with proper vocoder mapping
+# ################################
 
-# Seed needs to be set at top of yaml
-seed: 1986
+# Discrete SSL + ECAPA-TDNN with hybrid attention
+seed: 42
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
-# Dataset configuration
-data_folder: !PLACEHOLDER # Directory containing JSON files (use "." for current)
+# Results folder
 output_folder: !ref results/MSP_PODCAST/ultimate_discrete_ssl/<ssl_model_type>/<attention_mode>/<seed>
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
@@ -18,229 +16,246 @@ train_log: !ref <output_folder>/train_log.txt
 ### SSL Model Configuration (Based on DASB best practices)
 # Recommended: wavlm (best performance according to DASB)
 ssl_model_type: wavlm  # Options: hubert, wavlm, wav2vec2
-ssl_hub: microsoft/wavlm-large
+
+# SSL model hub configurations
+ssl_hubs:
+    wavlm: microsoft/wavlm-large
+    hubert: facebook/hubert-large-ll60k  
+    wav2vec2: facebook/wav2vec2-large-960h-lv60-self
+
+# Dynamic SSL hub selection
+ssl_hub: !apply:speechbrain.utils.hparams.choice
+    value: !ref <ssl_model_type>
+    choices: !ref <ssl_hubs>
+
 ssl_folder: !ref <save_folder>/ssl_checkpoint
 
-# Pre-trained K-means (IEMOCAP approach - no training needed!)
-# kmeans_repo_id: speechbrain/SSL_Quantization
-kmeans_cache_dir: !ref <save_folder>/kmeans_checkpoint
-kmeans_dataset: LibriSpeech-100-360-500
+# K-means and vocoder configurations for each SSL type
+vocoder_configs:
+    wavlm: 
+        vocoder_repo_id: speechbrain/hifigan-wavlm-l1-3-7-12-18-23-k1000-LibriTTS
+        kmeans_dataset: LibriSpeech
+        ssl_layers: [1, 3, 7, 12, 18, 23]
+    hubert: 
+        vocoder_repo_id: speechbrain/hifigan-hubert-k1000-LibriTTS
+        kmeans_dataset: LibriSpeech  
+        ssl_layers: [7, 23]
+    wav2vec2: 
+        vocoder_repo_id: speechbrain/hifigan-wav2vec-l1-3-7-12-18-23-k1000-LibriTTS
+        kmeans_dataset: LibriSpeech
+        ssl_layers: [1, 3, 7, 12, 18, 23]
+
+# Dynamic vocoder selection
+current_vocoder_config: !apply:speechbrain.utils.hparams.choice
+    value: !ref <ssl_model_type>
+    choices: !ref <vocoder_configs>
+
+# K-means cache directory
+kmeans_cache_dir: !ref <save_folder>/kmeans_cache
+kmeans_dataset: !ref <current_vocoder_config>[kmeans_dataset]
+
+# SSL settings
 freeze_ssl: True
 freeze_feature_extractor: True
-num_clusters: 1000
+num_codebooks: 6  # Number of codebooks/layers
+num_clusters: 1000  # K-means clusters
 
-### Tokenizer Configuration (IEMOCAP proven layers)
-ssl_layer_num: [1, 3, 7, 12, 18, 23]  # Optimal layer combination from IEMOCAP
-num_codebooks: 6
-deduplicate: [False, False, False, False, False, False]
-bpe_tokenizer_path: [null, null, null, null, null, null]
-sample_rate: 16000
+# Dynamic SSL layer selection
+ssl_layer_num: !ref <current_vocoder_config>[ssl_layers]
+
+# Attention mode configuration
+attention_mode: iemocap  # Options: iemocap, dasb, custom
 
 ### Model Architecture Configuration
-encoder_dim: 1024
-
+batch_size: 8  # Adjust based on GPU memory
 # Ultimate Model Settings
-attention_mode: hybrid  # Options: 'iemocap', 'advanced', 'hybrid'
+emb_dim: 1024
 use_positional_encoding: True   # Enhanced temporal modeling
-use_global_priors: True         # Learnable codebook importance
-use_layer_norm: True           # Better training stability
-dropout_rate: 0.1              # Regularization
+dropout: 0.15
+activation: !name:torch.nn.LeakyReLU
 
-# MSP-PODCAST Multi-class Settings (UPDATED!)
-different_speakers: False  # Use original Train/Dev/Test split
-use_original_split: True
-test_set_choice: 'both'    # Use both Test1 and Test2
+# Training Configuration
+number_of_epochs: 20
+base_lr: 0.0005
+max_lr: 0.001
+step_size: 65000
 
-# MSP-PODCAST 10-class emotion configuration
-out_n_neurons: 10  # N, H, X, A, S, U, C, O, D, F (instead of 4)
+# Sample rate
+sample_rate: 16000
 
-# Emotion class mapping for MSP-PODCAST (10 classes)
-emotion_classes: ['N', 'H', 'X', 'A', 'S', 'U', 'C', 'O', 'D', 'F']
-emotion_names: ['Neutral', 'Happy', 'Excited', 'Angry', 'Sad', 'Surprised', 'Contempt', 'Other', 'Disgusted', 'Fear']
-
-# Class weights for imbalanced data (optional)
-use_class_weights: True
-class_weights: [1.0, 1.5, 1.8, 3.5, 3.7, 10.3, 12.8, 19.8, 24.0, 30.7]  # Inverse frequency weights
-
-# Evaluation metrics configuration (NEW!)
+# Multi-class evaluation metrics configuration
 eval_metrics:
     primary_metric: 'macro_f1'        # Primary metric for model selection
-    additional_metrics: ['accuracy', 'weighted_f1', 'macro_recall', 'macro_precision']
-    compute_per_class: True           # Compute per-class metrics
-    compute_confusion_matrix: True    # Generate confusion matrix
+    secondary_metrics: ['accuracy', 'weighted_f1', 'precision_macro', 'recall_macro']
+    
+# Class weighting for imbalanced classes (optional)
+use_class_weights: False
+class_weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  # 10 MSP-PODCAST classes
 
-# Data paths
-train_annotation: !ref <data_folder>/msp_train_10class.json
-valid_annotation: !ref <data_folder>/msp_valid_10class.json
-test_annotation: !ref <data_folder>/msp_test_10class.json
-skip_prep: True
+# Data folders and files
+data_folder: !PLACEHOLDER  # Will be set via command line
 
-### Training Configuration
-precision: fp32
-number_of_epochs: 30
-batch_size: 8           # Increased for multi-class stability
-test_batch_size: 4
-lr: 0.0002             # IEMOCAP proven learning rate
+# MSP-PODCAST 10-class annotations
+train_annotation: msp_train_10class.json
+valid_annotation: msp_valid_10class.json
+test_annotation: msp_test_10class.json
 
-# Learning rate scheduling with macro-F1 (instead of error rate)
-lr_scheduling_metric: 'macro_f1'
-lr_scheduling_mode: 'max'  # Maximize macro-F1 (vs minimize error)
-
-### Dataloader Settings
+# Dataloader options
 train_dataloader_opts:
     batch_size: !ref <batch_size>
     shuffle: True
-    num_workers: 2
-    drop_last: False
+    num_workers: 4
 
 valid_dataloader_opts:
     batch_size: !ref <batch_size>
+    shuffle: False
+    num_workers: 4
 
 test_dataloader_opts:
-    batch_size: !ref <test_batch_size>
+    batch_size: !ref <batch_size>
+    shuffle: False
+    num_workers: 4
 
-### Advanced Configuration Options
 # Model selection based on SSL type
 ssl_model: !apply:speechbrain.utils.hparams.choice
     value: !ref <ssl_model_type>
     choices:
         wavlm: !new:speechbrain.lobes.models.huggingface_transformers.wavlm.WavLM
             source: !ref <ssl_hub>
-            output_norm: False
+            output_norm: True
             freeze: !ref <freeze_ssl>
             freeze_feature_extractor: !ref <freeze_feature_extractor>
             output_all_hiddens: True
             save_path: !ref <ssl_folder>
         hubert: !new:speechbrain.lobes.models.huggingface_transformers.hubert.HuBERT
-            source: facebook/hubert-large-ll60k
-            output_norm: False
+            source: !ref <ssl_hub>
+            output_norm: True
             freeze: !ref <freeze_ssl>
             freeze_feature_extractor: !ref <freeze_feature_extractor>
             output_all_hiddens: True
             save_path: !ref <ssl_folder>
         wav2vec2: !new:speechbrain.lobes.models.huggingface_transformers.wav2vec2.Wav2Vec2
-            source: facebook/wav2vec2-large
-            output_norm: False
+            source: !ref <ssl_hub>
+            output_norm: True
             freeze: !ref <freeze_ssl>
             freeze_feature_extractor: !ref <freeze_feature_extractor>
             output_all_hiddens: True
             save_path: !ref <ssl_folder>
 
-# Discrete SSL Codec
+# Discrete SSL Codec with dynamic vocoder
 codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.DiscreteSSL
     save_path: !ref <kmeans_cache_dir>
     ssl_model: !ref <ssl_model>
     kmeans_dataset: !ref <kmeans_dataset>
-    # kmeans_repo_id: !ref <kmeans_repo_id>
     num_clusters: !ref <num_clusters>
+    vocoder_repo_id: !ref <current_vocoder_config>[vocoder_repo_id]
 
 # Ultimate Discrete Embedding (IEMOCAP + enhancements)
 discrete_embedding_layer: !new:custom_model.Discrete_EmbeddingLayer
     num_codebooks: !ref <num_codebooks>
     vocab_size: !ref <num_clusters>
-    emb_dim: !ref <encoder_dim>
+    emb_dim: !ref <emb_dim>
+    pad_idx: 0
     use_positional_encoding: !ref <use_positional_encoding>
-    init_method: 'xavier'
-    freeze: False
+    dropout: !ref <dropout>
 
-# Hybrid Attention MLP (Best of both worlds)
+# Ultimate Attention MLP (IEMOCAP official + enhancements)
 attention_mlp: !new:custom_model.AttentionMLP
-    input_dim: !ref <encoder_dim>
-    hidden_dim: !ref <encoder_dim>
+    input_dim: !ref <emb_dim>
+    hidden_dim: 128
+    output_dim: 1
     num_codebooks: !ref <num_codebooks>
-    mode: !ref <attention_mode>
-    dropout_rate: !ref <dropout_rate>
-    use_layer_norm: !ref <use_layer_norm>
-    use_global_priors: !ref <use_global_priors>
+    dropout: !ref <dropout>
+    activation: !ref <activation>
 
-# ECAPA-TDNN Backbone (IEMOCAP proven configuration)
+# ECAPA-TDNN encoder
 embedding_model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
-    input_size: !ref <encoder_dim>
+    input_size: !ref <emb_dim>
     channels: [1024, 1024, 1024, 1024, 3072]
     kernel_sizes: [5, 3, 3, 3, 1]
     dilations: [1, 2, 3, 4, 1]
-    attention_channels: 64
+    attention_channels: 128
     lin_neurons: 192
 
-# Final Classifier (Updated for 10 classes)
+# Classifier
 classifier: !new:speechbrain.lobes.models.ECAPA_TDNN.Classifier
     input_size: 192
-    out_neurons: !ref <out_n_neurons>
+    out_neurons: 10  # MSP-PODCAST 10 classes
 
-### Training Components
-epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
-    limit: !ref <number_of_epochs>
-
-# Tokenizer configuration
-tokenizer_config:
-    SSL_layers: !ref <ssl_layer_num>
-    deduplicates: !ref <deduplicate>
-    bpe_tokenizers: !ref <bpe_tokenizer_path>
-
-# Module registration
+# Ultimate model combination
 modules:
-    classifier: !ref <classifier>
-    embedding_model: !ref <embedding_model>
-    attention_mlp: !ref <attention_mlp>
+    SSL_layers: !ref <ssl_layer_num>
+    ssl_model: !ref <ssl_model>
     codec: !ref <codec>
     discrete_embedding_layer: !ref <discrete_embedding_layer>
+    attention_mlp: !ref <attention_mlp>
+    embedding_model: !ref <embedding_model>
+    classifier: !ref <classifier>
 
+# Ultimate model for optimization
 model: !new:torch.nn.ModuleList
     - [!ref <embedding_model>, !ref <classifier>, !ref <discrete_embedding_layer>, !ref <attention_mlp>]
 
-### Loss and Optimization
+# Loss and metrics
 log_softmax: !new:speechbrain.nnet.activations.Softmax
     apply_log: True
 
-# Loss function with optional class weights
 compute_cost: !name:speechbrain.nnet.losses.nll_loss
 
-# Multi-class evaluation metrics (NEW!)
+# Enhanced multi-class error computation
 error_stats: !name:custom_model.MultiClassMetrics
-    num_classes: !ref <out_n_neurons>
-    class_names: !ref <emotion_classes>
-    primary_metric: !ref <eval_metrics>["primary_metric"]
-    additional_metrics: !ref <eval_metrics>["additional_metrics"]
+    primary_metric: !ref <eval_metrics>[primary_metric]
+    secondary_metrics: !ref <eval_metrics>[secondary_metrics]
 
-# Optimizer (IEMOCAP proven)
+# Optimizer
+opt_class: !name:torch.optim.Adam
+lr: !ref <base_lr>
+
 model_opt_class: !name:torch.optim.Adam
-    lr: !ref <lr>
+    lr: !ref <base_lr>
 
-# Learning rate scheduling (Updated for macro-F1)
+# Learning rate scheduling
 lr_annealing_model: !new:speechbrain.nnet.schedulers.ReduceLROnPlateau
-    factor: 0.5
+    factor: 0.8
     patience: 3
-    mode: !ref <lr_scheduling_mode>
-    verbose: True
+    min_lr: 0.00001
 
-### Logging and Checkpointing
-train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
-    save_file: !ref <train_log>
+# Learning rate scheduling configuration
+lr_scheduling_metric: 'primary_metric'  # Use primary metric for LR scheduling
+lr_scheduling_mode: 'max'  # For metrics like macro_f1 that should be maximized
 
-ckpt_interval_minutes: 15
+# Epoch counter
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
 
+# Checkpointer
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
         model: !ref <model>
         scheduler_model: !ref <lr_annealing_model>
-        attention_mlp: !ref <attention_mlp>
-        codec: !ref <codec>
-        discrete_embedding_layer: !ref <discrete_embedding_layer>
-        classifier: !ref <classifier>
         counter: !ref <epoch_counter>
 
-### Experimental Configurations for Multi-class
+# Logger
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
 
-# For initial testing (10-class is more challenging):
-# batch_size: 4
-# number_of_epochs: 50
-# lr: 0.0001
+# Tokenizer config for codec (if needed)
+tokenizer_config:
+    deduplicate: [False, True, False, True, False, True]  # Per layer deduplication
+    bpe_tokenizers: [null, null, null, null, null, null]  # No BPE tokenizers
 
-# For fast convergence:
-# use_class_weights: True
-# lr_annealing_patience: 2
+### Quick switching between SSL models ###
+# To use HuBERT: --ssl_model_type=hubert
+# To use Wav2Vec2: --ssl_model_type=wav2vec2  
+# To use WavLM: --ssl_model_type=wavlm (default)
 
-# For detailed analysis:
-# eval_metrics.compute_per_class: True
-# eval_metrics.compute_confusion_matrix: True
+### Training Examples ###
+# WavLM training:
+# python train_discrete_SSL.py hparams/train_discrete_SSL.yaml --ssl_model_type=wavlm --data_folder=/path/to/data
+
+# HuBERT training:  
+# python train_discrete_SSL.py hparams/train_discrete_SSL.yaml --ssl_model_type=hubert --data_folder=/path/to/data
+
+# Wav2Vec2 training:
+# python train_discrete_SSL.py hparams/train_discrete_SSL.yaml --ssl_model_type=wav2vec2 --data_folder=/path/to/data
