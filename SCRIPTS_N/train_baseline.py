@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Improved MSP-PODCAST emotion classification training script
-Using WavLM + ECAPA-TDNN
+Complete MSP-PODCAST emotion classification training script
+Using WavLM + ECAPA-TDNN with all fixes applied
 """
 
 import os
@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
 class SimpleMSPEmotionBrain(sb.Brain):
-    """Improved MSP-PODCAST emotion classification Brain"""
+    """MSP-PODCAST emotion classification Brain with macro-F1 metrics"""
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -28,55 +28,37 @@ class SimpleMSPEmotionBrain(sb.Brain):
         # For macro-F1 calculation
         self.predictions = []
         self.targets = []
-        
+    
     def compute_forward(self, batch, stage):
-        """计算前向传播"""
+        """Compute forward pass"""
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
         
-        # 使用WavLM提取特征
+        # Use WavLM to extract features
         with torch.no_grad():
             feats = self.modules.ssl_model(wavs)
             
-            # WavLM返回多个输出时的处理
+            # WavLM returns multiple outputs sometimes
             if isinstance(feats, tuple):
                 feats = feats[0]
         
-        # 保持时序信息！feats shape: (batch, time, features)
-        # 投影层处理每个时间步的特征
+        # Keep temporal information! feats shape: (batch, time, features)
+        # Project features at each time step
         feats = self.modules.feature_projection(feats)
         
-        # 计算特征序列的实际长度
+        # Calculate actual lengths of feature sequences
         wav_lens_ratio = wav_lens / wavs.shape[1]
         feat_lens = torch.round(wav_lens_ratio * feats.shape[1])
         
-        # ECAPA-TDNN处理完整的特征序列
-        # ECAPA-TDNN会在内部进行时序建模和池化
+        # ECAPA-TDNN processes the full feature sequence
+        # It will do temporal modeling and pooling internally
         embeddings = self.modules.embedding_model(feats, feat_lens)
         
-        # 分类器接收ECAPA-TDNN输出的固定维度嵌入
+        # Classifier receives fixed-dimension embeddings from ECAPA-TDNN
         outputs = self.modules.classifier(embeddings)
         outputs = self.hparams.log_softmax(outputs)
         
         return outputs
-    
-    def length_to_mask(self, length, max_len=None, dtype=None, device=None):
-        """将长度转换为掩码"""
-        assert len(length.shape) == 1
-        
-        if max_len is None:
-            max_len = length.max().long().item()
-        
-        if device is None:
-            device = length.device
-            
-        mask = torch.arange(max_len, device=device, dtype=length.dtype)\
-                    .expand(len(length), max_len) < length.unsqueeze(1)
-        
-        if dtype is not None:
-            mask = mask.to(dtype)
-        
-        return mask
     
     def compute_objectives(self, predictions, batch, stage):
         """Compute loss and metrics"""
@@ -295,22 +277,31 @@ class SimpleMSPEmotionBrain(sb.Brain):
         logger.info(f"Trainable parameters: {trainable_params:,}")
 
 def dataio_prepare(hparams):
-    """Prepare data loaders"""
+    """Prepare data loaders with robust audio handling"""
     
     # Audio processing pipeline
     @sb.utils.data_pipeline.takes("wav")
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav):
         try:
-            # Read audio
+            # 1. Read audio
             sig = sb.dataio.dataio.read_audio(wav)
             
-            # Ensure tensor is not empty
+            # 2. Ensure mono audio
+            if len(sig.shape) > 1:
+                # Stereo or multi-channel: shape is [channels, samples]
+                # Average across channels
+                sig = torch.mean(sig, dim=0)
+            
+            # 3. Ensure 1D tensor
+            sig = sig.squeeze()
+            
+            # 4. Ensure tensor is not empty
             if sig.shape[0] == 0:
                 logger.warning(f"Empty audio file: {wav}")
-                sig = torch.zeros(int(hparams["sample_rate"]))  # 1 second of silence
+                sig = torch.zeros(int(hparams["sample_rate"]))
             
-            # Check duration
+            # 5. Check and handle duration
             duration = sig.shape[0] / hparams["sample_rate"]
             min_duration = 0.5
             max_duration = 30
@@ -323,21 +314,25 @@ def dataio_prepare(hparams):
                 # Truncate long audio
                 sig = sig[:int(hparams["sample_rate"] * max_duration)]
             
-            # Normalize
+            # 6. Normalize
             max_val = sig.abs().max()
             if max_val > 0:
                 sig = sig / max_val * 0.95
             
-            # Ensure 2D tensor (batch_size=1, time)
-            if len(sig.shape) == 1:
-                sig = sig.unsqueeze(0)
-                
+            # 7. Ensure correct dtype
+            sig = sig.float()
+            
+            # Check for NaN or Inf
+            if torch.isnan(sig).any() or torch.isinf(sig).any():
+                logger.error(f"Audio contains NaN or Inf: {wav}")
+                sig = torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
+            
             return sig
             
         except Exception as e:
             logger.error(f"Failed to read audio {wav}: {str(e)}")
-            # Return 1 second of silence with proper shape
-            return torch.zeros(1, int(hparams["sample_rate"]))
+            # Return 1 second of silence (1D tensor)
+            return torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
     
     # Label processing pipeline
     @sb.utils.data_pipeline.takes("emo")
