@@ -59,48 +59,65 @@ class MSPPodcastUltimateBrain(sb.Brain):
     def compute_forward(self, batch, stage):
         """
         Forward computation using IEMOCAP official approach + enhancements
-        
-        Key differences from my previous version:
+    
+         Key differences from my previous version:
         1. Uses IEMOCAP's matrix multiplication for attention
         2. Proper codec calling with tokenizer_config
         3. More efficient computation pipeline
+        4. Supports both discrete SSL and direct SSL modes
         """
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
-        
-        # Extract discrete tokens using IEMOCAP official approach
-        with torch.no_grad():
-            # Move codec to device and set to eval (IEMOCAP official approach)
-            self.hparams.codec.to(self.device).eval()
+    
+        # 检查是否使用 discrete_ssl
+        use_discrete = hasattr(self.hparams, 'use_discrete_ssl') and self.hparams.use_discrete_ssl and hasattr(self.hparams, 'codec')
+    
+        if use_discrete:
+            # Extract discrete tokens using IEMOCAP official approach
+            with torch.no_grad():
+                # Move codec to device and set to eval (IEMOCAP official approach)
+                self.hparams.codec.to(self.device).eval()
             
-            # Call codec with tokenizer_config (IEMOCAP official way)
-            tokens, _, _ = self.hparams.codec(
+                # Call codec with tokenizer_config (IEMOCAP official way)
+                tokens, _, _ = self.hparams.codec(
                 wavs, wav_lens, **self.hparams.tokenizer_config
             )
         
-        # Embed discrete tokens (our enhanced embedding layer)
-        embeddings = self.modules.discrete_embedding_layer(tokens)
+            # Embed discrete tokens (our enhanced embedding layer)
+            embeddings = self.modules.discrete_embedding_layer(tokens)
         
-        # IEMOCAP official attention computation (THE KEY DIFFERENCE!)
-        att_w = self.modules.attention_mlp(embeddings)
+            # IEMOCAP official attention computation (THE KEY DIFFERENCE!)
+            att_w = self.modules.attention_mlp(embeddings)
         
         # IEMOCAP's elegant matrix multiplication approach
         # att_w: [batch, time, num_codebooks, 1]
         # embeddings: [batch, time, num_codebooks, emb_dim]
         # Result: [batch, time, emb_dim]
-        feats = torch.matmul(att_w.transpose(2, -1), embeddings).squeeze(-2)
-        
+            feats = torch.matmul(att_w.transpose(2, -1), embeddings).squeeze(-2)
+        else:
+            # 直接使用 SSL 模型路径
+            with torch.no_grad():
+            # 提取 SSL 特征
+                feats, _ = self.modules.ssl_model(wavs)
+            
+                # 使用特征投影
+                if hasattr(self.modules, 'feature_projection'):
+                    feats = self.modules.feature_projection(feats)
+            
+        # 创建虚拟注意力权重用于兼容性
+            att_w = torch.ones((feats.shape[0], feats.shape[1], 1, 1), device=feats.device)
+    
         # ECAPA-TDNN processing (same as IEMOCAP)
         embeddings = self.modules.embedding_model(feats, wav_lens)
-        
+    
         # Final classification
         outputs = self.modules.classifier(embeddings)
         outputs = self.hparams.log_softmax(outputs)
-        
+    
         # Store attention statistics for analysis (our enhancement)
         if stage != sb.Stage.TRAIN and hasattr(self, 'store_attention_stats') and self.store_attention_stats:
             self._store_attention_stats(att_w, batch.id)
-        
+    
         return outputs, att_w
     
     def compute_objectives(self, predictions, batch, stage):
