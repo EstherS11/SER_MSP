@@ -493,6 +493,12 @@ def main():
     # Prepare datasets
     try:
         datasets = dataio_prepare(hparams)
+        # 在 datasets = dataio_prepare(hparams) 之后立即添加：
+        logger.info("Testing data loading...")
+        test_item = datasets["train"][0]
+        logger.info(f"Sample item keys: {test_item.keys()}")
+        logger.info(f"Sig shape: {test_item['sig'].shape if 'sig' in test_item else 'NO SIG'}")
+        logger.info(f"Has length?: {'length' in test_item}")
     except Exception as e:
         logger.error(f"Dataset preparation failed: {e}")
         return
