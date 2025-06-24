@@ -56,7 +56,7 @@ num_clusters: 1000  # K-means clusters
 
 # Static configurations for each SSL type (will be selected dynamically)
 # WavLM configuration
-wavlm_vocoder_repo_id: speechbrain/hifigan-wavlm-l1-3-7-12-18-23-k1000-LibriTTS
+wavlm_vocoder_repo_id: speechbrain/hifigan-wavlm-k1000-LibriTTS
 wavlm_kmeans_dataset: LibriSpeech
 wavlm_ssl_layers: [1, 3, 7, 12, 18, 23]
 
@@ -171,13 +171,13 @@ ssl_model: !apply:speechbrain.utils.hparams.choice
             output_all_hiddens: True
             save_path: !ref <ssl_folder>
 
-# Discrete SSL Codec with dynamic vocoder
+# Discrete SSL Codec - 使用新的统一k-means系统
 codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.DiscreteSSL
     save_path: !ref <kmeans_cache_dir>
     ssl_model: !ref <ssl_model>
     kmeans_dataset: !ref <kmeans_dataset>
     num_clusters: !ref <num_clusters>
-    vocoder_repo_id: !ref <vocoder_repo_id>
+    kmeans_repo_id: speechbrain/SSL_Quantization
 
 # Ultimate Discrete Embedding (IEMOCAP + enhancements)
 discrete_embedding_layer: !new:custom_model.Discrete_EmbeddingLayer
