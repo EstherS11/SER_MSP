@@ -14,6 +14,7 @@ __pycache__/
 # 虚拟环境
 ser_env/
 msp_env/
+msp/
 venv/
 env/
 
@@ -35,3 +36,31 @@ slurm-*.err
 
 # Jupyter
 .ipynb_checkpoints/
+
+# 结果目录（包含模型缓存和检查点）
+results/
+**/results/
+
+# HuggingFace缓存
+**/.locks/
+**/ssl_checkpoint/
+**/kmeans_checkpoint/
+**/*.safetensors
+**/*.safetensors.index.json
+**/*.incomplete
+**/*.bin
+
+# 额外的模型格式
+**/*.h5
+**/*.hdf5
+**/*.model
+**/*.onnx
+**/*.tflite
+
+# 预处理后的数据
+**/*.npy
+**/*.npz
+**/*.hdf5
+**/*.h5
+**/*.csv
+**/*.json
