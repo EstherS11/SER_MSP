@@ -63,17 +63,32 @@ def dataio_prepare(hparams):
     @sb.utils.data_pipeline.takes("wav")
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav):
-        sig = sb.dataio.dataio.read_audio(wav)
-        return sig
+        try:
+            sig = sb.dataio.dataio.read_audio(wav)
+            # 确保音频不是空的
+            if sig.shape[0] == 0:
+                print(f"警告: 空音频文件 {wav}，使用默认音频")
+                sig = torch.zeros(hparams["sample_rate"])
+            return sig
+        except Exception as e:
+            print(f"警告: 无法读取音频文件 {wav}: {str(e)}")
+            # 返回一个短的默认音频
+            return torch.zeros(hparams["sample_rate"])
+ 
+   
     
     # 标签处理管道
     @sb.utils.data_pipeline.takes("emo")
     @sb.utils.data_pipeline.provides("emo_id")
     def label_pipeline(emo):
+        try:
         # 10分类情感映射
-        emo_map = {'N': 0, 'H': 1, 'X': 2, 'A': 3, 'S': 4,
+            emo_map = {'N': 0, 'H': 1, 'X': 2, 'A': 3, 'S': 4,
                    'U': 5, 'C': 6, 'O': 7, 'D': 8, 'F': 9}
-        return torch.tensor(emo_map.get(emo, 0), dtype=torch.long)
+            return torch.tensor(emo_map.get(emo, 0), dtype=torch.long)
+        except Exception as e:
+            print(f"警告: 无法处理情感标签 {emo}: {str(e)}")
+            return torch.tensor(0, dtype=torch.long)  # 默认为中性
     
     # 创建数据集
     datasets = {}
