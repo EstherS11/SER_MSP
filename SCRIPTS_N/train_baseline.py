@@ -1,606 +1,277 @@
 #!/usr/bin/env python3
 """
-Complete MSP-PODCAST emotion classification training script
-Using WavLM + ECAPA-TDNN with all fixes applied
+Pure PyTorch implementation - WavLM + ECAPA-TDNN for emotion classification
+No SpeechBrain dependency!
 """
 
-import os
-import sys
 import torch
-import logging
-import speechbrain as sb
-from hyperpyyaml import load_hyperpyyaml
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchaudio
+from transformers import WavLMModel
+import json
 from tqdm import tqdm
 import numpy as np
-from sklearn.metrics import f1_score, confusion_matrix, precision_recall_fscore_support, classification_report
-import warnings
-warnings.filterwarnings('ignore')
+from sklearn.metrics import f1_score, classification_report
+import os
+import logging
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class SimpleMSPEmotionBrain(sb.Brain):
-    """MSP-PODCAST emotion classification Brain with macro-F1 metrics"""
-    
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Initialize metrics
-        self.error_metrics = self.hparams.error_stats()
-        # For macro-F1 calculation
-        self.predictions = []
-        self.targets = []
-    
-    def compute_forward(self, batch, stage):
-        """Compute forward pass"""
-        # Handle custom batch format (dictionary)
-        if isinstance(batch, dict):
-            wavs = batch['sig'][0].to(self.device)
-            wav_lens = batch['sig'][1].to(self.device)
-        else:
-            # Standard SpeechBrain batch
-            batch = batch.to(self.device)
-            wavs, wav_lens = batch.sig
+# Simple ECAPA-TDNN implementation
+class ECAPA_TDNN(nn.Module):
+    def __init__(self, input_size=1024, lin_neurons=192):
+        super().__init__()
+        self.conv1 = nn.Conv1d(input_size, 512, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv1d(512, 512, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv1d(512, 512, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv1d(512, 1536, kernel_size=1)
         
-        # Use WavLM to extract features
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.bn2 = nn.BatchNorm1d(512)
+        self.bn3 = nn.BatchNorm1d(512)
+        self.bn4 = nn.BatchNorm1d(1536)
+        
+        self.fc = nn.Linear(1536, lin_neurons)
+        
+    def forward(self, x):
+        # x shape: (batch, time, features) -> (batch, features, time)
+        x = x.transpose(1, 2)
+        
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.bn4(self.conv4(x)))
+        
+        # Global pooling
+        x = self.pool(x).squeeze(-1)
+        x = self.fc(x)
+        
+        return x
+
+# Simple Emotion Model
+class EmotionModel(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        # Load WavLM
+        self.wavlm = WavLMModel.from_pretrained("microsoft/wavlm-large")
+        self.wavlm.freeze_feature_encoder()
+        
+        # Feature projection
+        self.projection = nn.Linear(1024, 1024)
+        
+        # ECAPA-TDNN
+        self.ecapa = ECAPA_TDNN(input_size=1024, lin_neurons=192)
+        
+        # Classifier
+        self.classifier = nn.Linear(192, num_classes)
+        
+    def forward(self, wavs):
+        # Extract WavLM features
         with torch.no_grad():
-            feats = self.modules.ssl_model(wavs)
-            
-            # WavLM returns multiple outputs sometimes
-            if isinstance(feats, tuple):
-                feats = feats[0]
+            outputs = self.wavlm(wavs, output_hidden_states=True)
+            features = outputs.hidden_states[-1]  # Last layer features
         
-        # Keep temporal information! feats shape: (batch, time, features)
-        # Project features at each time step
-        feats = self.modules.feature_projection(feats)
+        # Project features
+        features = self.projection(features)
         
-        # Calculate actual lengths of feature sequences
-        wav_lens_ratio = wav_lens / wavs.shape[1]
-        feat_lens = torch.round(wav_lens_ratio * feats.shape[1])
+        # ECAPA-TDNN
+        embeddings = self.ecapa(features)
         
-        # ECAPA-TDNN processes the full feature sequence
-        # It will do temporal modeling and pooling internally
-        embeddings = self.modules.embedding_model(feats, feat_lens)
+        # Classification
+        logits = self.classifier(embeddings)
         
-        # Classifier receives fixed-dimension embeddings from ECAPA-TDNN
-        outputs = self.modules.classifier(embeddings)
-        outputs = self.hparams.log_softmax(outputs)
-        
-        return outputs
-    
-    def compute_objectives(self, predictions, batch, stage):
-        """Compute loss and metrics"""
-        # Handle both custom and standard batch formats
-        if isinstance(batch, dict):
-            emo_ids = batch['emo_id']
-            if emo_ids.device != predictions.device:
-                emo_ids = emo_ids.to(predictions.device)
-            batch_id = batch['id']
-        else:
-            emo_ids = batch.emo_id
-            batch_id = batch.id
-        
-        # Ensure emo_ids is 1D (not 2D)
-        if emo_ids.dim() > 1:
-            emo_ids = emo_ids.squeeze(-1)
-        
-        # Compute loss
-        loss = self.hparams.compute_cost(predictions, emo_ids)
-        
-        # Debug info on first batch
-        if stage == sb.Stage.TRAIN and not hasattr(self, '_logged_shapes'):
-            logger.info(f"Debug - predictions shape: {predictions.shape}")
-            logger.info(f"Debug - emo_ids shape: {emo_ids.shape}")
-            self._logged_shapes = True
-        
-        # For evaluation stages, compute error rate and collect predictions
-        if stage != sb.Stage.TRAIN:
-            self.error_metrics.append(batch_id, predictions, emo_ids)
-            
-            # Collect predictions for macro-F1
-            pred_labels = predictions.argmax(dim=-1)
-            self.predictions.extend(pred_labels.cpu().numpy())
-            self.targets.extend(emo_ids.cpu().numpy())
-        
-        # Log training statistics
-        if stage == sb.Stage.TRAIN and hasattr(self, 'step') and self.step % 100 == 0:
-            with torch.no_grad():
-                pred_labels = predictions.argmax(dim=-1)
-                acc = (pred_labels == emo_ids).float().mean()
-                logger.info(f"Step {self.step} - Loss: {loss:.4f}, Acc: {acc:.2%}")
-        
-        return loss
-    
-    def on_stage_start(self, stage, epoch):
-        """Stage start processing"""
-        if stage != sb.Stage.TRAIN:
-            # Reset metrics
-            self.error_metrics = self.hparams.error_stats()
-            self.predictions = []
-            self.targets = []
-            
-        # Set model state
-        if stage == sb.Stage.TRAIN:
-            self.modules.train()
-            # SSL model always in eval mode
-            self.modules.ssl_model.eval()
-        else:
-            self.modules.eval()
-            
-        logger.info(f"Starting {stage} stage, Epoch {epoch}")
-    
-    def on_stage_end(self, stage, stage_loss, epoch):
-        """Stage end processing"""
-        # Store statistics
-        stage_stats = {"loss": stage_loss}
-        
-        if stage == sb.Stage.TRAIN:
-            self.train_stats = stage_stats
-        else:
-            # Calculate error rate (keep for compatibility)
-            stage_stats["error_rate"] = self.error_metrics.summarize("average")
-            
-            # Calculate detailed metrics
-            if len(self.predictions) > 0:
-                # Macro F1
-                stage_stats["macro_f1"] = f1_score(
-                    self.targets, 
-                    self.predictions, 
-                    average='macro'
-                )
-                
-                # Weighted F1 (accounts for class imbalance)
-                stage_stats["weighted_f1"] = f1_score(
-                    self.targets,
-                    self.predictions,
-                    average='weighted'
-                )
-                
-                # Per-class metrics
-                precision, recall, f1, support = precision_recall_fscore_support(
-                    self.targets,
-                    self.predictions,
-                    average=None,
-                    zero_division=0
-                )
-                
-                # Store per-class F1 scores
-                stage_stats["per_class_f1"] = f1
-                stage_stats["per_class_support"] = support
-                
-                # Calculate macro precision and recall
-                stage_stats["macro_precision"] = precision.mean()
-                stage_stats["macro_recall"] = recall.mean()
-                
-                # Calculate minority class performance (classes with < 10% of data)
-                total_samples = len(self.targets)
-                minority_mask = support < (0.1 * total_samples)
-                if minority_mask.any():
-                    stage_stats["minority_f1"] = f1[minority_mask].mean()
-                else:
-                    stage_stats["minority_f1"] = 0.0
-                    
-            else:
-                stage_stats["macro_f1"] = 0.0
-                stage_stats["weighted_f1"] = 0.0
-                stage_stats["macro_precision"] = 0.0
-                stage_stats["macro_recall"] = 0.0
-                stage_stats["minority_f1"] = 0.0
-            
-        # Validation: perform learning rate scheduling
-        if stage == sb.Stage.VALID:
-            # Use macro-F1 for scheduling (higher is better, so use negative)
-            metric_for_scheduler = -stage_stats["macro_f1"]
-            old_lr, new_lr = self.hparams.lr_annealing_model(metric_for_scheduler)
-            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
-            
-            # Log statistics
-            self.hparams.train_logger.log_stats(
-                stats_meta={
-                    "epoch": epoch,
-                    "lr": old_lr,
-                },
-                train_stats=self.train_stats,
-                valid_stats=stage_stats,
-            )
-            
-            # Save checkpoint
-            self.checkpointer.save_and_keep_only(
-                meta={
-                    "macro_f1": stage_stats["macro_f1"],
-                    "weighted_f1": stage_stats["weighted_f1"],
-                    "epoch": epoch
-                }, 
-                min_keys=["error_rate"],
-                max_keys=["macro_f1", "weighted_f1"],
-                num_to_keep=3
-            )
-            
-            # Log meaningful metrics
-            logger.info(f"Valid - Epoch {epoch}")
-            logger.info(f"  Loss: {stage_loss:.4f}")
-            logger.info(f"  Macro F1: {stage_stats['macro_f1']:.4f}")
-            logger.info(f"  Weighted F1: {stage_stats['weighted_f1']:.4f}")
-            logger.info(f"  Macro Precision: {stage_stats['macro_precision']:.4f}")
-            logger.info(f"  Macro Recall: {stage_stats['macro_recall']:.4f}")
-            if stage_stats['minority_f1'] > 0:
-                logger.info(f"  Minority Classes F1: {stage_stats['minority_f1']:.4f}")
-        
-        # Test: report results with detailed breakdown
-        elif stage == sb.Stage.TEST:
-            self.hparams.train_logger.log_stats(
-                stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats=stage_stats,
-            )
-            
-            logger.info("="*60)
-            logger.info("TEST RESULTS")
-            logger.info("="*60)
-            logger.info(f"Loss: {stage_loss:.4f}")
-            logger.info(f"Macro F1: {stage_stats['macro_f1']:.4f}")
-            logger.info(f"Weighted F1: {stage_stats['weighted_f1']:.4f}")
-            logger.info(f"Macro Precision: {stage_stats['macro_precision']:.4f}")
-            logger.info(f"Macro Recall: {stage_stats['macro_recall']:.4f}")
-            
-            if stage_stats['minority_f1'] > 0:
-                logger.info(f"Minority Classes F1: {stage_stats['minority_f1']:.4f}")
-            
-            # Print per-class performance
-            if "per_class_f1" in stage_stats:
-                logger.info("\nPer-class F1 scores:")
-                emotion_names = ['Neutral', 'Happy', 'Excited', 'Angry', 'Sad',
-                               'Surprise', 'Contempt', 'Other', 'Disgust', 'Fear']
-                for i, (f1, support) in enumerate(zip(stage_stats["per_class_f1"], 
-                                                     stage_stats["per_class_support"])):
-                    if i < len(emotion_names):
-                        logger.info(f"  {emotion_names[i]:10s}: F1={f1:.3f} (n={int(support)})")
-                
-                # Print confusion matrix
-                logger.info("\nClassification Report:")
-                report = classification_report(
-                    self.targets,
-                    self.predictions,
-                    target_names=emotion_names[:len(np.unique(self.targets))],
-                    digits=3
-                )
-                logger.info("\n" + report)
-            
-            logger.info("="*60)
-    
-    def create_optimizers(self):
-        """Create optimizers"""
-        # Get all parameters to optimize
-        params = []
-        for module in self.modules.values():
-            # Skip frozen SSL model
-            if module == self.modules.ssl_model:
-                continue
-            params.extend(module.parameters())
-        
-        # Create optimizer
-        if hasattr(self.hparams, "model_opt_class"):
-            self.optimizer = self.hparams.model_opt_class(params)
-        else:
-            self.optimizer = self.hparams.opt_class(params)
-            
-        logger.info(f"Optimizer created with {len(params)} parameter groups")
-    
-    def on_fit_start(self):
-        """Processing before training starts"""
-        super().on_fit_start()
-        
-        # Ensure SSL model is in eval mode and parameters are frozen
-        self.modules.ssl_model.eval()
-        for param in self.modules.ssl_model.parameters():
-            param.requires_grad = False
-            
-        logger.info("SSL model frozen")
-        
-        # Print model information
-        total_params = sum(p.numel() for p in self.modules.parameters())
-        trainable_params = sum(p.numel() for p in self.modules.parameters() if p.requires_grad)
-        logger.info(f"Total parameters: {total_params:,}")
-        logger.info(f"Trainable parameters: {trainable_params:,}")
+        return logits
 
-def dataio_prepare(hparams):
-    """Prepare data loaders with robust audio handling"""
-    
-    # Audio processing pipeline
-    @sb.utils.data_pipeline.takes("wav")
-    @sb.utils.data_pipeline.provides("sig")
-    def audio_pipeline(wav):
-        try:
-            # 1. Read audio
-            sig = sb.dataio.dataio.read_audio(wav)
-            
-            # 2. Ensure mono audio
-            if len(sig.shape) > 1:
-                # Stereo or multi-channel: shape is [channels, samples]
-                # Average across channels
-                sig = torch.mean(sig, dim=0)
-            
-            # 3. Ensure 1D tensor
-            sig = sig.squeeze()
-            
-            # 4. Ensure tensor is not empty
-            if sig.shape[0] == 0:
-                logger.warning(f"Empty audio file: {wav}")
-                sig = torch.zeros(int(hparams["sample_rate"]))
-            
-            # 5. Check and handle duration
-            duration = sig.shape[0] / hparams["sample_rate"]
-            min_duration = 0.5
-            max_duration = 30
-            
-            if duration < min_duration:
-                # Pad short audio
-                pad_length = int(hparams["sample_rate"] * min_duration) - sig.shape[0]
-                sig = torch.nn.functional.pad(sig, (0, pad_length), mode='constant', value=0)
-            elif duration > max_duration:
-                # Truncate long audio
-                sig = sig[:int(hparams["sample_rate"] * max_duration)]
-            
-            # 6. Normalize
-            max_val = sig.abs().max()
-            if max_val > 0:
-                sig = sig / max_val * 0.95
-            
-            # 7. Ensure correct dtype
-            sig = sig.float()
-            
-            # Check for NaN or Inf
-            if torch.isnan(sig).any() or torch.isinf(sig).any():
-                logger.error(f"Audio contains NaN or Inf: {wav}")
-                sig = torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
-            
-            return sig
-            
-        except Exception as e:
-            logger.error(f"Failed to read audio {wav}: {str(e)}")
-            # Return 1 second of silence (1D tensor)
-            return torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
-    
-    # Label processing pipeline
-    @sb.utils.data_pipeline.takes("emo")
-    @sb.utils.data_pipeline.provides("emo_id")
-    def label_pipeline(emo):
-        try:
-            # 10-class emotion mapping
-            emo_map = {
-                'N': 0,  # Neutral
-                'H': 1,  # Happy
-                'X': 2,  # Excited
-                'A': 3,  # Angry
-                'S': 4,  # Sad
-                'U': 5,  # Surprise
-                'C': 6,  # Contempt
-                'O': 7,  # Other
-                'D': 8,  # Disgust
-                'F': 9   # Fear
-            }
-            
-            if emo not in emo_map:
-                logger.warning(f"Unknown emotion label: {emo}, defaulting to neutral")
-                return torch.tensor(0, dtype=torch.long)
-                
-            return torch.tensor(emo_map[emo], dtype=torch.long)
-            
-        except Exception as e:
-            logger.error(f"Failed to process emotion label {emo}: {str(e)}")
-            return torch.tensor(0, dtype=torch.long)
-    
-    # Create datasets
-    datasets = {}
-    data_info = {
-        "train": hparams["train_annotation"],
-        "valid": hparams["valid_annotation"],
-        "test": hparams["test_annotation"],
-    }
-    
-    for dataset in data_info:
-        logger.info(f"Loading {dataset} dataset...")
-        datasets[dataset] = sb.dataio.dataset.DynamicItemDataset.from_json(
-            json_path=data_info[dataset],
-            replacements={"data_root": hparams["data_folder"]},
-            dynamic_items=[audio_pipeline, label_pipeline],
-            output_keys=["id", "sig", "emo_id"],
-        )
-        logger.info(f"{dataset} dataset size: {len(datasets[dataset])}")
-    
-    # Note: Sorting can cause issues with variable length sequences in some cases
-    # If you encounter batching errors, comment out the sorting code
-    sorting = hparams.get("sorting", "random")
-    if sorting == "ascending":
-        try:
-            datasets["train"] = datasets["train"].filtered_sorted(
-                sort_key="duration",  # Use 'duration' instead of 'length'
-                reverse=False
-            )
-            hparams["train_dataloader_opts"]["shuffle"] = False
-            logger.info("Training set sorted by duration")
-        except Exception as e:
-            logger.warning(f"Could not sort dataset: {e}. Using random order.")
-            hparams["train_dataloader_opts"]["shuffle"] = True
-    
-    # Custom collate function to fix the IndexError
-    def custom_collate_fn(batch):
-        """Custom collate function that completely avoids PaddedBatch"""
-        # Separate elements
-        ids = [item["id"] for item in batch]
-        sigs = [item["sig"] for item in batch]
-        emo_ids = [item["emo_id"] for item in batch]
+# Simple Dataset
+class MSPDataset(Dataset):
+    def __init__(self, json_file, data_root, max_length=5*16000):  # 5 seconds
+        with open(json_file, 'r') as f:
+            self.data = json.load(f)
         
-        # Find max length
-        max_len = max(sig.shape[0] for sig in sigs)
+        self.items = list(self.data.items())
+        self.data_root = data_root
+        self.max_length = max_length
         
-        # Pad all signals to max length
-        padded_sigs = []
-        lengths = []
-        for sig in sigs:
-            orig_len = sig.shape[0]
-            if orig_len < max_len:
-                # Pad with zeros
-                padded = torch.nn.functional.pad(sig, (0, max_len - orig_len))
-            else:
-                padded = sig
-            padded_sigs.append(padded)
-            lengths.append(orig_len)
-        
-        # Convert to tensors
-        sig_tensor = torch.stack(padded_sigs)
-        length_tensor = torch.tensor(lengths, dtype=torch.float32)
-        # Calculate relative lengths (0 to 1)
-        length_tensor = length_tensor / max_len
-        emo_tensor = torch.stack(emo_ids)
-        
-        # Return a simple dictionary with the expected structure
-        return {
-            'id': ids,
-            'sig': (sig_tensor, length_tensor),  # Tuple format expected by compute_forward
-            'emo_id': emo_tensor
+        # Emotion mapping
+        self.emo_map = {
+            'N': 0, 'H': 1, 'X': 2, 'A': 3, 'S': 4,
+            'U': 5, 'C': 6, 'O': 7, 'D': 8, 'F': 9
         }
+        
+    def __len__(self):
+        return len(self.items)
     
-    # Apply custom collate function
-    hparams["train_dataloader_opts"]["collate_fn"] = custom_collate_fn
-    hparams["valid_dataloader_opts"]["collate_fn"] = custom_collate_fn
-    hparams["test_dataloader_opts"]["collate_fn"] = custom_collate_fn
-    
-    return datasets
+    def __getitem__(self, idx):
+        key, item = self.items[idx]
+        
+        # Load audio
+        wav_path = item['wav'].replace('{data_root}', self.data_root)
+        try:
+            wav, sr = torchaudio.load(wav_path)
+            
+            # Convert to mono
+            if wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            
+            # Resample to 16kHz if needed
+            if sr != 16000:
+                resampler = torchaudio.transforms.Resample(sr, 16000)
+                wav = resampler(wav)
+            
+            wav = wav.squeeze(0)
+            
+            # Pad or truncate
+            if wav.shape[0] < self.max_length:
+                wav = F.pad(wav, (0, self.max_length - wav.shape[0]))
+            else:
+                wav = wav[:self.max_length]
+                
+        except Exception as e:
+            logger.error(f"Error loading {wav_path}: {e}")
+            wav = torch.zeros(self.max_length)
+        
+        # Get label
+        emo = item['emo']
+        label = self.emo_map.get(emo, 0)
+        
+        return wav, label
 
-def check_data_integrity(datasets, hparams):
-    """Check data integrity"""
-    emotion_names = {
-        0: 'Neutral', 1: 'Happy', 2: 'Excited', 3: 'Angry', 4: 'Sad',
-        5: 'Surprise', 6: 'Contempt', 7: 'Other', 8: 'Disgust', 9: 'Fear'
-    }
+def train_epoch(model, dataloader, optimizer, device):
+    model.train()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
     
-    for split_name, dataset in datasets.items():
-        logger.info(f"Checking {split_name} dataset...")
+    for batch_idx, (wavs, labels) in enumerate(tqdm(dataloader, desc="Training")):
+        wavs = wavs.to(device)
+        labels = labels.to(device)
         
-        # Statistics
-        label_counts = {}
-        error_count = 0
+        optimizer.zero_grad()
         
-        # Sample check
-        sample_size = min(100, len(dataset))
-        indices = np.random.choice(len(dataset), sample_size, replace=False)
+        # Forward pass
+        logits = model(wavs)
+        loss = F.cross_entropy(logits, labels)
         
-        for idx in tqdm(indices, desc=f"Checking {split_name}"):
-            try:
-                item = dataset[int(idx)]
-                
-                # Check required fields
-                assert "sig" in item, "Missing audio signal"
-                assert "emo_id" in item, "Missing emotion label"
-                assert item["sig"].shape[0] > 0, "Empty audio signal"
-                
-                # Count labels
-                label = item["emo_id"].item()
-                label_counts[label] = label_counts.get(label, 0) + 1
-                
-            except Exception as e:
-                logger.error(f"{split_name} dataset item {idx} has issues: {e}")
-                error_count += 1
+        # Backward pass
+        loss.backward()
+        optimizer.step()
         
-        # Report statistics
-        logger.info(f"{split_name} dataset statistics:")
-        logger.info(f"  - Total samples: {len(dataset)}")
-        logger.info(f"  - Checked samples: {sample_size}")
-        logger.info(f"  - Error samples: {error_count}")
-        logger.info(f"  - Label distribution:")
-        for label, count in sorted(label_counts.items()):
-            percentage = count / sample_size * 100
-            logger.info(f"    {emotion_names[label]}: {count} ({percentage:.1f}%)")
+        total_loss += loss.item()
         
-        if error_count > sample_size * 0.1:  # Error rate > 10%
-            logger.warning(f"{split_name} dataset has high error rate!")
+        # Predictions
+        preds = logits.argmax(dim=-1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        
+        if batch_idx % 100 == 0:
+            logger.info(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+    
+    # Calculate metrics
+    macro_f1 = f1_score(all_labels, all_preds, average='macro')
+    
+    return total_loss / len(dataloader), macro_f1
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    total_loss = 0
+    
+    with torch.no_grad():
+        for wavs, labels in tqdm(dataloader, desc="Evaluating"):
+            wavs = wavs.to(device)
+            labels = labels.to(device)
+            
+            logits = model(wavs)
+            loss = F.cross_entropy(logits, labels)
+            
+            total_loss += loss.item()
+            
+            preds = logits.argmax(dim=-1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    # Calculate metrics
+    macro_f1 = f1_score(all_labels, all_preds, average='macro')
+    
+    # Print classification report
+    emotion_names = ['Neutral', 'Happy', 'Excited', 'Angry', 'Sad',
+                     'Surprise', 'Contempt', 'Other', 'Disgust', 'Fear']
+    report = classification_report(all_labels, all_preds, 
+                                 target_names=emotion_names[:len(np.unique(all_labels))],
+                                 digits=3)
+    
+    return total_loss / len(dataloader), macro_f1, report
 
 def main():
-    """Main training function"""
-    # Set random seeds
-    torch.manual_seed(42)
-    np.random.seed(42)
+    # Configuration
+    data_folder = "/data/user_data/esthers/DATA"
+    batch_size = 8
+    num_epochs = 1
+    learning_rate = 1e-3
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('training.log')
-        ]
-    )
+    logger.info(f"Using device: {device}")
     
-    logger.info("="*60)
-    logger.info("MSP-PODCAST Emotion Classification")
-    logger.info("="*60)
+    # Create datasets
+    train_dataset = MSPDataset("msp_train_10class.json", data_folder)
+    valid_dataset = MSPDataset("msp_valid_10class.json", data_folder)
+    test_dataset = MSPDataset("msp_test_10class.json", data_folder)
     
-    # Parse arguments
-    hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
+    logger.info(f"Train size: {len(train_dataset)}")
+    logger.info(f"Valid size: {len(valid_dataset)}")
+    logger.info(f"Test size: {len(test_dataset)}")
     
-    # Setup device
-    if run_opts.get("device") is None:
-        if torch.cuda.is_available():
-            run_opts["device"] = "cuda"
-            logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
-        else:
-            run_opts["device"] = "cpu"
-            logger.warning("CUDA not available, using CPU for training")
+    # Create dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, 
+                            shuffle=True, num_workers=2, pin_memory=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, 
+                            shuffle=False, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, 
+                           shuffle=False, num_workers=2, pin_memory=True)
     
-    # Load hyperparameters
-    with open(hparams_file) as fin:
-        hparams = load_hyperpyyaml(fin, overrides)
+    # Create model
+    model = EmotionModel(num_classes=10).to(device)
     
-    # Create experiment directory
-    sb.create_experiment_directory(
-        experiment_directory=hparams["output_folder"],
-        hyperparams_to_save=hparams_file,
-        overrides=overrides,
-    )
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Total parameters: {total_params:,}")
+    logger.info(f"Trainable parameters: {trainable_params:,}")
     
-    # Prepare datasets
-    try:
-        datasets = dataio_prepare(hparams)
-    except Exception as e:
-        logger.error(f"Dataset preparation failed: {e}")
-        return
+    # Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
-    # Check data integrity
-    check_data_integrity(datasets, hparams)
-    
-    # Initialize Brain
-    emotion_brain = SimpleMSPEmotionBrain(
-        modules=hparams["modules"],
-        hparams=hparams,
-        run_opts=run_opts,
-        checkpointer=hparams["checkpointer"],
-    )
-    
-    # Create optimizers
-    emotion_brain.create_optimizers()
-    
-    # Train
-    try:
-        emotion_brain.fit(
-            epoch_counter=emotion_brain.hparams.epoch_counter,
-            train_set=datasets["train"],
-            valid_set=datasets["valid"],
-            train_loader_kwargs=hparams["train_dataloader_opts"],
-            valid_loader_kwargs=hparams["valid_dataloader_opts"],
-        )
-    except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
-    except Exception as e:
-        logger.error(f"Error during training: {e}")
-        raise
+    # Training loop
+    for epoch in range(num_epochs):
+        logger.info(f"\nEpoch {epoch+1}/{num_epochs}")
+        
+        # Train
+        train_loss, train_f1 = train_epoch(model, train_loader, optimizer, device)
+        logger.info(f"Train Loss: {train_loss:.4f}, Train Macro-F1: {train_f1:.4f}")
+        
+        # Validate
+        valid_loss, valid_f1, _ = evaluate(model, valid_loader, device)
+        logger.info(f"Valid Loss: {valid_loss:.4f}, Valid Macro-F1: {valid_f1:.4f}")
     
     # Test
-    logger.info("\nStarting final evaluation...")
-    test_stats = emotion_brain.evaluate(
-        test_set=datasets["test"],
-        min_key="error_rate",
-        test_loader_kwargs=hparams["test_dataloader_opts"],
-    )
+    logger.info("\nFinal Test Evaluation:")
+    test_loss, test_f1, report = evaluate(model, test_loader, device)
+    logger.info(f"Test Loss: {test_loss:.4f}, Test Macro-F1: {test_f1:.4f}")
+    logger.info(f"\nClassification Report:\n{report}")
     
-    logger.info("\nTraining completed successfully!")
+    # Save model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': num_epochs,
+        'test_f1': test_f1
+    }, 'emotion_model.pth')
+    logger.info("Model saved!")
 
 if __name__ == "__main__":
     main()
