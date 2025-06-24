@@ -14,6 +14,8 @@ from tqdm import tqdm
 import numpy as np
 from sklearn.metrics import f1_score, confusion_matrix, precision_recall_fscore_support, classification_report
 import warnings
+from torch.nn.utils.rnn import pad_sequence
+
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
@@ -31,8 +33,13 @@ class SimpleMSPEmotionBrain(sb.Brain):
     
     def compute_forward(self, batch, stage):
         """Compute forward pass"""
-        batch = batch.to(self.device)
-        wavs, wav_lens = batch.sig
+        # Unpack batch - now using custom format
+        wavs = batch["sig"]  # Padded tensor: [batch, max_length]
+        wav_lens = batch["sig_lengths"]  # Original lengths: [batch]
+        
+        # Move to device
+        wavs = wavs.to(self.device)
+        wav_lens = wav_lens.to(self.device)
         
         # Use WavLM to extract features
         with torch.no_grad():
@@ -47,11 +54,12 @@ class SimpleMSPEmotionBrain(sb.Brain):
         feats = self.modules.feature_projection(feats)
         
         # Calculate actual lengths of feature sequences
-        wav_lens_ratio = wav_lens / wavs.shape[1]
-        feat_lens = torch.round(wav_lens_ratio * feats.shape[1])
+        # Convert audio lengths to feature lengths (assuming stride of 20ms)
+        feat_lens = (wav_lens / (self.hparams.sample_rate * 0.02)).long()
+        # Ensure at least 1 frame
+        feat_lens = torch.clamp(feat_lens, min=1)
         
         # ECAPA-TDNN processes the full feature sequence
-        # It will do temporal modeling and pooling internally
         embeddings = self.modules.embedding_model(feats, feat_lens)
         
         # Classifier receives fixed-dimension embeddings from ECAPA-TDNN
@@ -62,14 +70,14 @@ class SimpleMSPEmotionBrain(sb.Brain):
     
     def compute_objectives(self, predictions, batch, stage):
         """Compute loss and metrics"""
-        emo_ids = batch.emo_id
+        emo_ids = batch["emo_id"].to(self.device)
         
         # Compute loss
         loss = self.hparams.compute_cost(predictions, emo_ids)
         
         # For evaluation stages, compute error rate and collect predictions
         if stage != sb.Stage.TRAIN:
-            self.error_metrics.append(batch.id, predictions, emo_ids)
+            self.error_metrics.append(batch["id"], predictions, emo_ids)
             
             # Collect predictions for macro-F1
             pred_labels = predictions.argmax(dim=-1)
@@ -276,93 +284,123 @@ class SimpleMSPEmotionBrain(sb.Brain):
         logger.info(f"Total parameters: {total_params:,}")
         logger.info(f"Trainable parameters: {trainable_params:,}")
 
+def custom_collate_fn(batch):
+    """
+    Custom collate function to handle variable-length audio sequences.
+    Returns a dictionary with:
+        - id: list of sample IDs
+        - sig: padded audio tensor [batch, max_length]
+        - sig_lengths: original lengths of each audio sample
+        - emo_id: emotion labels tensor
+    """
+    ids = []
+    signals = []
+    lengths = []
+    emotion_ids = []
+    
+    # Process each sample in the batch
+    for sample in batch:
+        # Ensure ID exists
+        id_val = sample.get("id", "unknown_id")
+        ids.append(id_val)
+        
+        # Handle audio signal
+        signal = sample["sig"]
+        if signal.dim() == 0 or signal.nelement() == 0:
+            # Create safe fallback signal (1 second of silence)
+            signal = torch.zeros(16000, dtype=torch.float32)
+        
+        # Ensure signal is 1D tensor
+        if signal.dim() > 1:
+            signal = signal.squeeze(0)
+        elif signal.dim() == 0:
+            signal = signal.unsqueeze(0)
+        
+        signals.append(signal)
+        lengths.append(len(signal))
+        emotion_ids.append(sample["emo_id"])
+    
+    # Pad signals to the maximum length in the batch
+    padded_signals = pad_sequence(signals, batch_first=True, padding_value=0.0)
+    
+    # Convert to tensors
+    lengths_tensor = torch.tensor(lengths, dtype=torch.long)
+    emotion_ids_tensor = torch.tensor(emotion_ids, dtype=torch.long)
+    
+    # Return batch as a dictionary
+    return {
+        "id": ids,
+        "sig": padded_signals,
+        "sig_lengths": lengths_tensor,
+        "emo_id": emotion_ids_tensor
+    }
+
+def audio_pipeline(wav):
+    """Robust audio processing pipeline"""
+    try:
+        # 1. Read audio
+        sig = sb.dataio.dataio.read_audio(wav)
+        
+        # 2. Ensure mono audio
+        if len(sig.shape) > 1:
+            sig = torch.mean(sig, dim=0)
+        
+        # 3. Ensure 1D tensor
+        sig = sig.squeeze()
+        
+        # 4. Handle empty audio
+        if sig.numel() == 0:
+            logger.warning(f"Empty audio file: {wav}")
+            return torch.zeros(16000, dtype=torch.float32)
+        
+        # 5. Normalize
+        max_val = sig.abs().max()
+        if max_val > 0:
+            sig = sig / max_val * 0.95
+        
+        # 6. Ensure correct dtype
+        sig = sig.float()
+        
+        # 7. Check for NaN/Inf
+        if torch.isnan(sig).any() or torch.isinf(sig).any():
+            logger.error(f"Audio contains NaN or Inf: {wav}")
+            return torch.zeros(16000, dtype=torch.float32)
+        
+        return sig
+        
+    except Exception as e:
+        logger.error(f"Failed to process audio {wav}: {str(e)}")
+        return torch.zeros(16000, dtype=torch.float32)
+
+def label_pipeline(emo):
+    """Label processing pipeline"""
+    try:
+        # 10-class emotion mapping
+        emo_map = {
+            'N': 0,  # Neutral
+            'H': 1,  # Happy
+            'X': 2,  # Excited
+            'A': 3,  # Angry
+            'S': 4,  # Sad
+            'U': 5,  # Surprise
+            'C': 6,  # Contempt
+            'O': 7,  # Other
+            'D': 8,  # Disgust
+            'F': 9   # Fear
+        }
+        
+        if emo not in emo_map:
+            logger.warning(f"Unknown emotion label: {emo}, defaulting to neutral")
+            return torch.tensor(0, dtype=torch.long)
+            
+        return torch.tensor(emo_map[emo], dtype=torch.long)
+        
+    except Exception as e:
+        logger.error(f"Failed to process emotion label {emo}: {str(e)}")
+        return torch.tensor(0, dtype=torch.long)
+
 def dataio_prepare(hparams):
     """Prepare data loaders with robust audio handling"""
-    
-    # Audio processing pipeline
-    @sb.utils.data_pipeline.takes("wav")
-    @sb.utils.data_pipeline.provides("sig")
-    def audio_pipeline(wav):
-        try:
-            # 1. Read audio
-            sig = sb.dataio.dataio.read_audio(wav)
-            
-            # 2. Ensure mono audio
-            if len(sig.shape) > 1:
-                # Stereo or multi-channel: shape is [channels, samples]
-                # Average across channels
-                sig = torch.mean(sig, dim=0)
-            
-            # 3. Ensure 1D tensor
-            sig = sig.squeeze()
-            
-            # 4. Ensure tensor is not empty
-            if sig.shape[0] == 0:
-                logger.warning(f"Empty audio file: {wav}")
-                sig = torch.zeros(int(hparams["sample_rate"]))
-            
-            # 5. Check and handle duration
-            duration = sig.shape[0] / hparams["sample_rate"]
-            min_duration = 0.5
-            max_duration = 30
-            
-            if duration < min_duration:
-                # Pad short audio
-                pad_length = int(hparams["sample_rate"] * min_duration) - sig.shape[0]
-                sig = torch.nn.functional.pad(sig, (0, pad_length), mode='constant', value=0)
-            elif duration > max_duration:
-                # Truncate long audio
-                sig = sig[:int(hparams["sample_rate"] * max_duration)]
-            
-            # 6. Normalize
-            max_val = sig.abs().max()
-            if max_val > 0:
-                sig = sig / max_val * 0.95
-            
-            # 7. Ensure correct dtype
-            sig = sig.float()
-            
-            # Check for NaN or Inf
-            if torch.isnan(sig).any() or torch.isinf(sig).any():
-                logger.error(f"Audio contains NaN or Inf: {wav}")
-                sig = torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
-            
-            return sig
-            
-        except Exception as e:
-            logger.error(f"Failed to read audio {wav}: {str(e)}")
-            # Return 1 second of silence (1D tensor)
-            return torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
-    
-    # Label processing pipeline
-    @sb.utils.data_pipeline.takes("emo")
-    @sb.utils.data_pipeline.provides("emo_id")
-    def label_pipeline(emo):
-        try:
-            # 10-class emotion mapping
-            emo_map = {
-                'N': 0,  # Neutral
-                'H': 1,  # Happy
-                'X': 2,  # Excited
-                'A': 3,  # Angry
-                'S': 4,  # Sad
-                'U': 5,  # Surprise
-                'C': 6,  # Contempt
-                'O': 7,  # Other
-                'D': 8,  # Disgust
-                'F': 9   # Fear
-            }
-            
-            if emo not in emo_map:
-                logger.warning(f"Unknown emotion label: {emo}, defaulting to neutral")
-                return torch.tensor(0, dtype=torch.long)
-                
-            return torch.tensor(emo_map[emo], dtype=torch.long)
-            
-        except Exception as e:
-            logger.error(f"Failed to process emotion label {emo}: {str(e)}")
-            return torch.tensor(0, dtype=torch.long)
-    
     # Create datasets
     datasets = {}
     data_info = {
@@ -380,75 +418,14 @@ def dataio_prepare(hparams):
             output_keys=["id", "sig", "emo_id"],
         )
         logger.info(f"{dataset} dataset size: {len(datasets[dataset])}")
-    
-    # Note: Sorting can cause issues with variable length sequences in some cases
-    # If you encounter batching errors, comment out the sorting code
-    sorting = hparams.get("sorting", "random")
-    if sorting == "ascending":
-        try:
-            datasets["train"] = datasets["train"].filtered_sorted(
-                sort_key="duration",  # Use 'duration' instead of 'length'
-                reverse=False
-            )
-            hparams["train_dataloader_opts"]["shuffle"] = False
-            logger.info("Training set sorted by duration")
-        except Exception as e:
-            logger.warning(f"Could not sort dataset: {e}. Using random order.")
-            hparams["train_dataloader_opts"]["shuffle"] = True
-    
-    # Custom collate function to fix the IndexError
-    def custom_collate_fn(batch):
-        """Custom collate function that handles the batch properly"""
-        from speechbrain.dataio.batch import PaddedData
-        from types import SimpleNamespace
         
-        # Separate elements
-        ids = [item["id"] for item in batch]
-        sigs = [item["sig"] for item in batch]
-        emo_ids = [item["emo_id"] for item in batch]
-        
-        # Find max length
-        max_len = max(sig.shape[0] for sig in sigs)
-        
-        # Pad all signals to max length
-        padded_sigs = []
-        lengths = []
-        for sig in sigs:
-            orig_len = sig.shape[0]
-            if orig_len < max_len:
-                # Pad with zeros
-                padded = torch.nn.functional.pad(sig, (0, max_len - orig_len))
-            else:
-                padded = sig
-            padded_sigs.append(padded)
-            lengths.append(orig_len)
-        
-        # Convert to tensors
-        sig_tensor = torch.stack(padded_sigs)
-        length_tensor = torch.tensor(lengths, dtype=torch.float32)
-        # Calculate relative lengths (0 to 1)
-        length_tensor = length_tensor / max_len
-        emo_tensor = torch.stack(emo_ids)
-        
-        # Create PaddedData object
-        padded_data = PaddedData(sig_tensor, length_tensor)
-        
-        # Return batch
-        return SimpleNamespace(
-            id=ids,
-            sig=padded_data,
-            emo_id=emo_tensor
-        )
-    
-    # Apply custom collate function
-    hparams["train_dataloader_opts"]["collate_fn"] = custom_collate_fn
-    hparams["valid_dataloader_opts"]["collate_fn"] = custom_collate_fn
-    hparams["test_dataloader_opts"]["collate_fn"] = custom_collate_fn
+        # Set custom collate function
+        datasets[dataset].set_collate_fn(custom_collate_fn)
     
     return datasets
 
 def check_data_integrity(datasets, hparams):
-    """Check data integrity"""
+    """Enhanced data integrity check with detailed reporting"""
     emotion_names = {
         0: 'Neutral', 1: 'Happy', 2: 'Excited', 3: 'Angry', 4: 'Sad',
         5: 'Surprise', 6: 'Contempt', 7: 'Other', 8: 'Disgust', 9: 'Fear'
@@ -458,11 +435,13 @@ def check_data_integrity(datasets, hparams):
         logger.info(f"Checking {split_name} dataset...")
         
         # Statistics
-        label_counts = {}
+        label_counts = {i: 0 for i in range(10)}
         error_count = 0
+        empty_audio_count = 0
+        invalid_audio_count = 0
         
         # Sample check
-        sample_size = min(100, len(dataset))
+        sample_size = min(500, len(dataset))
         indices = np.random.choice(len(dataset), sample_size, replace=False)
         
         for idx in tqdm(indices, desc=f"Checking {split_name}"):
@@ -470,30 +449,53 @@ def check_data_integrity(datasets, hparams):
                 item = dataset[int(idx)]
                 
                 # Check required fields
-                assert "sig" in item, "Missing audio signal"
-                assert "emo_id" in item, "Missing emotion label"
-                assert item["sig"].shape[0] > 0, "Empty audio signal"
+                if "sig" not in item:
+                    raise KeyError("Missing audio signal")
+                if "emo_id" not in item:
+                    raise KeyError("Missing emotion label")
+                
+                signal = item["sig"]
+                
+                # Check signal validity
+                if signal.nelement() == 0:
+                    empty_audio_count += 1
+                    raise ValueError("Empty audio signal")
+                
+                if torch.isnan(signal).any() or torch.isinf(signal).any():
+                    invalid_audio_count += 1
+                    raise ValueError("Invalid audio values (NaN/Inf)")
                 
                 # Count labels
                 label = item["emo_id"].item()
-                label_counts[label] = label_counts.get(label, 0) + 1
+                if label not in label_counts:
+                    logger.warning(f"Invalid label {label} in sample {item.get('id', 'unknown')}")
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                else:
+                    label_counts[label] += 1
                 
             except Exception as e:
-                logger.error(f"{split_name} dataset item {idx} has issues: {e}")
                 error_count += 1
+                sample_id = item.get("id", f"index_{idx}")
+                logger.debug(f"{split_name} dataset item {sample_id} has issues: {e}")
         
         # Report statistics
+        total_samples = len(dataset)
         logger.info(f"{split_name} dataset statistics:")
-        logger.info(f"  - Total samples: {len(dataset)}")
+        logger.info(f"  - Total samples: {total_samples}")
         logger.info(f"  - Checked samples: {sample_size}")
-        logger.info(f"  - Error samples: {error_count}")
-        logger.info(f"  - Label distribution:")
-        for label, count in sorted(label_counts.items()):
+        logger.info(f"  - Error samples: {error_count} ({error_count/sample_size:.2%})")
+        logger.info(f"  - Empty audio: {empty_audio_count}")
+        logger.info(f"  - Invalid audio: {invalid_audio_count}")
+        
+        logger.info("Label distribution (sampled):")
+        for label in range(10):
+            count = label_counts.get(label, 0)
             percentage = count / sample_size * 100
-            logger.info(f"    {emotion_names[label]}: {count} ({percentage:.1f}%)")
+            label_name = emotion_names.get(label, f"Unknown_{label}")
+            logger.info(f"    {label_name:10s}: {count} ({percentage:.1f}%)")
         
         if error_count > sample_size * 0.1:  # Error rate > 10%
-            logger.warning(f"{split_name} dataset has high error rate!")
+            logger.warning(f"{split_name} dataset has high error rate in sampled data!")
 
 def main():
     """Main training function"""
@@ -522,7 +524,7 @@ def main():
     if run_opts.get("device") is None:
         if torch.cuda.is_available():
             run_opts["device"] = "cuda"
-            logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
         else:
             run_opts["device"] = "cpu"
             logger.warning("CUDA not available, using CPU for training")
