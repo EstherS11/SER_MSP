@@ -302,47 +302,42 @@ def dataio_prepare(hparams):
     @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav):
         try:
-            # Read audio info
-            info = sb.dataio.dataio.read_audio_info(wav)
+            # Read audio
+            sig = sb.dataio.dataio.read_audio(wav)
             
-            # Check audio length
-            min_duration = 0.5  # minimum 0.5 seconds
-            max_duration = 30   # maximum 30 seconds
-            duration = info.num_frames / info.sample_rate
+            # Ensure tensor is not empty
+            if sig.shape[0] == 0:
+                logger.warning(f"Empty audio file: {wav}")
+                sig = torch.zeros(int(hparams["sample_rate"]))  # 1 second of silence
+            
+            # Check duration
+            duration = sig.shape[0] / hparams["sample_rate"]
+            min_duration = 0.5
+            max_duration = 30
             
             if duration < min_duration:
-                logger.warning(f"Audio too short ({duration:.2f}s): {wav}")
-                # Return zero-padded audio
-                sig = torch.zeros(int(hparams["sample_rate"] * min_duration))
+                # Pad short audio
+                pad_length = int(hparams["sample_rate"] * min_duration) - sig.shape[0]
+                sig = torch.nn.functional.pad(sig, (0, pad_length), mode='constant', value=0)
             elif duration > max_duration:
-                logger.warning(f"Audio too long ({duration:.2f}s), will truncate: {wav}")
-                sig = sb.dataio.dataio.read_audio(wav)
+                # Truncate long audio
                 sig = sig[:int(hparams["sample_rate"] * max_duration)]
-            else:
-                sig = sb.dataio.dataio.read_audio(wav)
-            
-            # Resample to target sample rate if needed
-            if info.sample_rate != hparams["sample_rate"]:
-                sig = sb.processing.speech_augmentation.Resample(
-                    orig_freq=info.sample_rate,
-                    new_freq=hparams["sample_rate"]
-                )(sig.unsqueeze(0)).squeeze(0)
             
             # Normalize
-            if sig.abs().max() > 0:
-                sig = sig / sig.abs().max() * 0.95
+            max_val = sig.abs().max()
+            if max_val > 0:
+                sig = sig / max_val * 0.95
             
-            # Check for NaN or Inf
-            if torch.isnan(sig).any() or torch.isinf(sig).any():
-                logger.error(f"Audio contains NaN or Inf: {wav}")
-                sig = torch.zeros_like(sig)
+            # Ensure 2D tensor (batch_size=1, time)
+            if len(sig.shape) == 1:
+                sig = sig.unsqueeze(0)
                 
             return sig
             
         except Exception as e:
             logger.error(f"Failed to read audio {wav}: {str(e)}")
-            # Return 1 second of silence
-            return torch.zeros(hparams["sample_rate"])
+            # Return 1 second of silence with proper shape
+            return torch.zeros(1, int(hparams["sample_rate"]))
     
     # Label processing pipeline
     @sb.utils.data_pipeline.takes("emo")
@@ -391,15 +386,20 @@ def dataio_prepare(hparams):
         )
         logger.info(f"{dataset} dataset size: {len(datasets[dataset])}")
     
-    # Sort training set by length for efficiency
-    if hparams.get("sorting", "ascending") == "ascending":
-        datasets["train"] = datasets["train"].filtered_sorted(
-            sort_key="length",
-            reverse=False
-        )
-        # No need to shuffle after sorting
-        hparams["train_dataloader_opts"]["shuffle"] = False
-        logger.info("Training set sorted by length")
+    # Note: Sorting can cause issues with variable length sequences in some cases
+    # If you encounter batching errors, comment out the sorting code
+    sorting = hparams.get("sorting", "random")
+    if sorting == "ascending":
+        try:
+            datasets["train"] = datasets["train"].filtered_sorted(
+                sort_key="duration",  # Use 'duration' instead of 'length'
+                reverse=False
+            )
+            hparams["train_dataloader_opts"]["shuffle"] = False
+            logger.info("Training set sorted by duration")
+        except Exception as e:
+            logger.warning(f"Could not sort dataset: {e}. Using random order.")
+            hparams["train_dataloader_opts"]["shuffle"] = True
     
     return datasets
 
