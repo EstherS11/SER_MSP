@@ -171,6 +171,10 @@ ssl_model: !apply:speechbrain.utils.hparams.choice
             output_all_hiddens: True
             save_path: !ref <ssl_folder>
 
+# 控制标志 - 禁用codec相关代码路径
+use_discrete_ssl: False  # 设为False禁用DiscreteSSL代码路径
+use_attention_mlp: False  # 设为False禁用attention相关代码
+
 # 暂时注释掉 DiscreteSSL，先测试基础SSL模型
 # Discrete SSL Codec - 暂时禁用进行测试
 # codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.DiscreteSSL
