@@ -186,7 +186,7 @@ use_attention_mlp: False  # 设为False禁用attention相关代码
 
 # 简化的embedding层配置，直接使用SSL特征
 ssl_embedding_layer: !new:speechbrain.nnet.linear.Linear
-    input_size: 1024  # WavLM输出维度
+    input_size: 2048  # WavLM输出维度
     n_neurons: !ref <emb_dim>
 
 # Ultimate Discrete Embedding (暂时简化)
@@ -200,7 +200,8 @@ ssl_embedding_layer: !new:speechbrain.nnet.linear.Linear
 
 # 简化版本：直接处理SSL特征
 feature_projection: !new:speechbrain.nnet.linear.Linear
-    input_size: 1024  # WavLM hidden size
+    # input_size: 1024  # WavLM hidden size
+    input_size: 2048  # ECAPA-TDNN input size
     n_neurons: !ref <emb_dim>
 
 # Ultimate Attention MLP (暂时移除，避免参数不匹配)
@@ -214,7 +215,8 @@ feature_projection: !new:speechbrain.nnet.linear.Linear
 
 # ECAPA-TDNN encoder
 embedding_model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
-    input_size: !ref <emb_dim>
+    # input_size: !ref <emb_dim>
+    input_size: 2048
     channels: [1024, 1024, 1024, 1024, 3072]
     kernel_sizes: [5, 3, 3, 3, 1]
     dilations: [1, 2, 3, 4, 1]
