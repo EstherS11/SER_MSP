@@ -70,14 +70,26 @@ class SimpleMSPEmotionBrain(sb.Brain):
         """Compute loss and metrics"""
         # Handle both custom and standard batch formats
         if isinstance(batch, dict):
-            emo_ids = batch['emo_id'].to(self.device)
+            emo_ids = batch['emo_id']
+            if emo_ids.device != predictions.device:
+                emo_ids = emo_ids.to(predictions.device)
             batch_id = batch['id']
         else:
             emo_ids = batch.emo_id
             batch_id = batch.id
         
+        # Ensure emo_ids is 1D (not 2D)
+        if emo_ids.dim() > 1:
+            emo_ids = emo_ids.squeeze(-1)
+        
         # Compute loss
         loss = self.hparams.compute_cost(predictions, emo_ids)
+        
+        # Debug info on first batch
+        if stage == sb.Stage.TRAIN and not hasattr(self, '_logged_shapes'):
+            logger.info(f"Debug - predictions shape: {predictions.shape}")
+            logger.info(f"Debug - emo_ids shape: {emo_ids.shape}")
+            self._logged_shapes = True
         
         # For evaluation stages, compute error rate and collect predictions
         if stage != sb.Stage.TRAIN:
