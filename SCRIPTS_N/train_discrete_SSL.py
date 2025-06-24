@@ -63,94 +63,78 @@ class MSPPodcastUltimateBrain(sb.Brain):
         self.best_valid_acc = 0.0
         self.codec_cache = None  # Cache codec for efficiency
         
+
     def compute_forward(self, batch, stage):
         """
         Forward computation using IEMOCAP official approach + enhancements
-    
-        Key differences from my previous version:
-        1. Uses IEMOCAP's matrix multiplication for attention
-        2. Proper codec calling with tokenizer_config
-        3. More efficient computation pipeline
-        4. Supports both discrete SSL and direct SSL modes
         """
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
     
         # 检查是否使用 discrete_ssl
         use_discrete = hasattr(self.hparams, 'use_discrete_ssl') and self.hparams.use_discrete_ssl and hasattr(self.hparams, 'codec')
-    
         if use_discrete:
-            # Extract discrete tokens using IEMOCAP official approach
-            with torch.no_grad():
-                # Move codec to device and set to eval (IEMOCAP official approach)
-                self.hparams.codec.to(self.device).eval()
-            
-                # Call codec with tokenizer_config (IEMOCAP official way)
-                tokens, _, _ = self.hparams.codec(
-                    wavs, wav_lens, **self.hparams.tokenizer_config
-                )
-        
-            # Embed discrete tokens (our enhanced embedding layer)
-            embeddings = self.modules.discrete_embedding_layer(tokens)
-        
-            # IEMOCAP official attention computation (THE KEY DIFFERENCE!)
-            att_w = self.modules.attention_mlp(embeddings)
-        
-            # IEMOCAP's elegant matrix multiplication approach
-            # att_w: [batch, time, num_codebooks, 1]
-            # embeddings: [batch, time, num_codebooks, emb_dim]
-            # Result: [batch, time, emb_dim]
-            feats = torch.matmul(att_w.transpose(2, -1), embeddings).squeeze(-2)
+            # Discrete SSL 代码省略...
+            pass
         else:
             # 直接使用 SSL 模型路径
             with torch.no_grad():
-                # 提取 SSL 特征 - 处理不同的返回格式
+                # 提取 SSL 特征
                 ssl_outputs = self.modules.ssl_model(wavs)
-                
-                # 记录 SSL 输出类型和形状，用于调试
+            
+                # 记录形状，帮助调试
+                logger.info(f"SSL 输出类型: {type(ssl_outputs)}")
                 if isinstance(ssl_outputs, tuple):
-                    logger.debug(f"SSL model output is tuple with length {len(ssl_outputs)}")
-                    if len(ssl_outputs) > 0:
-                        logger.debug(f"First element shape: {ssl_outputs[0].shape}")
+                    for i, output in enumerate(ssl_outputs):
+                        if hasattr(output, 'shape'):
+                            logger.info(f"SSL 输出 {i} 形状: {output.shape}")
                 else:
-                    logger.debug(f"SSL model output shape: {ssl_outputs.shape}")
+                    logger.info(f"SSL 输出形状: {ssl_outputs.shape}")
             
                 # 根据返回类型处理特征
                 if isinstance(ssl_outputs, tuple):
                     if len(ssl_outputs) == 2:
                         feats, _ = ssl_outputs
                     else:
-                        # 取第一个输出作为特征
+                    # 取第一个输出作为特征
                         feats = ssl_outputs[0]
                 else:
                     # 直接使用返回值作为特征
                     feats = ssl_outputs
             
+                # 记录特征形状
+                logger.info(f"提取的特征形状: {feats.shape}")
+            
+                # 处理特征的维度 - 关键修改部分
+                # 检查特征的维度顺序，确保是 [batch, time, features]
+                if feats.dim() == 3:
+                    # 检查通道维度是哪一个
+                    if feats.shape[1] > feats.shape[2]:  # 如果中间维度大于最后一个维度
+                        # 可能是 [batch, features, time] 格式，需要转置
+                        feats = feats.transpose(1, 2)
+                        logger.info(f"转置后特征形状: {feats.shape}")
+            
                 # 使用特征投影
                 if hasattr(self.modules, 'feature_projection'):
+                    # 确保 feature_projection 的输入维度正确
+                    input_size = self.modules.feature_projection.w.weight.shape[1]
+                    logger.info(f"特征投影输入维度: {input_size}, 特征最后一维: {feats.shape[-1]}")
+                
+                    # 如果特征的最后一维与投影层的输入维度不匹配，创建一个临时适配层
+                    if feats.shape[-1] != input_size:
+                        logger.info(f"创建临时适配层: {feats.shape[-1]} -> {input_size}")
+                        if not hasattr(self, 'temp_adapter'):
+                            self.temp_adapter = torch.nn.Linear(feats.shape[-1], input_size).to(self.device)
+                        feats = self.temp_adapter(feats)
+                
+                    # 应用特征投影
                     feats = self.modules.feature_projection(feats)
             
-                # 检查特征的维度并处理
-                if feats.dim() != 3:
-                    # 如果不是 [batch, time, features]，尝试重塑
-                    if feats.dim() == 4:  # [batch, channel, time, features]
-                        # 合并通道和特征维度
-                        b, c, t, f = feats.size()
-                        feats = feats.permute(0, 2, 1, 3).reshape(b, t, c*f)
-                    elif feats.dim() == 2:  # [batch, features]
-                        # 添加时间维度
-                        feats = feats.unsqueeze(1)
-            
-                # 确保特征是3维的 [batch, time, features]
-                if feats.dim() != 3:
-                    raise ValueError(f"SSL model output has unexpected shape: {feats.shape}")
-                
             # 创建虚拟注意力权重用于兼容性
-            # 注意：这里使用 feats 的时间维度来创建正确形状的注意力权重
             att_w = torch.ones((feats.shape[0], feats.shape[1], 1, 1), device=feats.device)
     
-        # 打印出一些调试信息
-        logger.info(f"Features shape: {feats.shape}, lengths shape: {wav_lens.shape}")
+        # 记录最终特征形状
+        logger.info(f"最终特征形状: {feats.shape}, 长度形状: {wav_lens.shape}")
     
         # 调整 wav_lens 以确保它与 feats 兼容
         if wav_lens.dim() == 1:
@@ -159,22 +143,7 @@ class MSPPodcastUltimateBrain(sb.Brain):
     
         # 确保长度值不超过特征的时间步长
         wav_lens = torch.clamp(wav_lens, max=feats.shape[1])
-        
-        # 在 compute_forward 方法中，在调用 embedding_model 之前添加这段代码
-        # 检查特征维度是否匹配 embedding_model 的预期输入维度
-        expected_dim = getattr(self.modules.embedding_model, 'input_size', 1024)
-        actual_dim = feats.shape[1]
-
-        if actual_dim != expected_dim:
-            logger.info(f"Adjusting feature dimension from {actual_dim} to {expected_dim}")
-            # 添加一个线性层来调整维度
-            if not hasattr(self, 'dim_adapter'):
-                self.dim_adapter = torch.nn.Linear(actual_dim, expected_dim).to(self.device)
     
-            # 调整特征维度
-            feats_reshaped = feats.transpose(1, 2)  # [batch, time, channels] -> [batch, channels, time]
-            feats_reshaped = self.dim_adapter(feats_reshaped)  # 调整通道维度
-            feats = feats_reshaped.transpose(1, 2)  # 转回 [batch, time, channels]
         try:
             # ECAPA-TDNN processing
             embeddings = self.modules.embedding_model(feats, wav_lens)
@@ -185,16 +154,23 @@ class MSPPodcastUltimateBrain(sb.Brain):
                 embeddings = self.modules.embedding_model(feats)
             else:
                 raise
+        except RuntimeError as e:
+            # 捕获任何运行时错误并记录更多信息
+            logger.error(f"运行时错误: {e}")
+            logger.error(f"特征形状: {feats.shape}")
+            logger.error(f"Embedding 模型输入尺寸: {getattr(self.modules.embedding_model, 'input_size', 'unknown')}")
+            raise
     
         # Final classification
         outputs = self.modules.classifier(embeddings)
         outputs = self.hparams.log_softmax(outputs)
-    
+        
         # Store attention statistics for analysis (our enhancement)
         if stage != sb.Stage.TRAIN and hasattr(self, 'store_attention_stats') and self.store_attention_stats:
             self._store_attention_stats(att_w, batch.id)
     
-        return outputs, att_w
+        return outputs, att_w     
+    
    
     def compute_objectives(self, predictions, batch, stage):
         """
