@@ -22,7 +22,7 @@ ssl_hub: microsoft/wavlm-large
 ssl_folder: !ref <save_folder>/ssl_checkpoint
 
 # Pre-trained K-means (IEMOCAP approach - no training needed!)
-kmeans_repo_id: speechbrain/SSL_Quantization
+# kmeans_repo_id: speechbrain/SSL_Quantization
 kmeans_cache_dir: !ref <save_folder>/kmeans_checkpoint
 kmeans_dataset: LibriSpeech-100-360-500
 freeze_ssl: True
@@ -131,7 +131,7 @@ codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.Discr
     save_path: !ref <kmeans_cache_dir>
     ssl_model: !ref <ssl_model>
     kmeans_dataset: !ref <kmeans_dataset>
-    kmeans_repo_id: !ref <kmeans_repo_id>
+    # kmeans_repo_id: !ref <kmeans_repo_id>
     num_clusters: !ref <num_clusters>
 
 # Ultimate Discrete Embedding (IEMOCAP + enhancements)
