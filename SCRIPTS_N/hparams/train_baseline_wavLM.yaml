@@ -1,9 +1,9 @@
-# 简化的配置
+# 改进的MSP-PODCAST情感分类配置
 seed: 42
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
 # 基本参数
-output_folder: !ref results/MSP_PODCAST/simple_wavlm
+output_folder: !ref results/MSP_PODCAST/improved_wavlm
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
@@ -11,10 +11,18 @@ train_log: !ref <output_folder>/train_log.txt
 ssl_hub: microsoft/wavlm-large
 ssl_folder: !ref <save_folder>/ssl_checkpoint
 
-# 简单模型配置
-batch_size: 8
-emb_dim: 1024
+# 训练参数
+batch_size: 16  # 增加批次大小
+gradient_accumulation: 2  # 梯度累积
 sample_rate: 16000
+number_of_epochs: 30  # 增加训练轮数
+enable_augmentation: True  # 启用数据增强
+
+# 模型维度
+emb_dim: 1024
+hidden_dim: 512
+attention_dim: 128
+num_classes: 10
 
 # 数据路径
 data_folder: !PLACEHOLDER  # 命令行设置
@@ -25,20 +33,30 @@ test_annotation: msp_test_10class.json
 # 数据加载器设置
 train_dataloader_opts:
     batch_size: !ref <batch_size>
-    shuffle: True
-    num_workers: 1
+    shuffle: True  # 如果不排序则shuffle
+    num_workers: 4  # 增加工作进程
+    pin_memory: True  # GPU优化
+    drop_last: True  # 丢弃最后不完整的批次
 
 valid_dataloader_opts:
     batch_size: !ref <batch_size>
     shuffle: False
-    num_workers: 1
+    num_workers: 4
+    pin_memory: True
 
 test_dataloader_opts:
     batch_size: !ref <batch_size>
     shuffle: False
-    num_workers: 1
+    num_workers: 4
+    pin_memory: True
 
-# 简化的模型定义
+# 数据增强（可选）
+augmentation: !new:speechbrain.lobes.augment.TimeDomainSpecAugment
+    sample_rate: !ref <sample_rate>
+    speeds: [95, 100, 105]  # 速度扰动
+    perturb_prob: 0.0  # 训练时设置为1.0
+
+# WavLM模型
 ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.wavlm.WavLM
     source: !ref <ssl_hub>
     output_norm: True
@@ -46,24 +64,35 @@ ssl_model: !new:speechbrain.lobes.models.huggingface_transformers.wavlm.WavLM
     freeze_feature_extractor: True
     save_path: !ref <ssl_folder>
 
-# 简单投影层
-feature_projection: !new:speechbrain.nnet.linear.Linear
-    input_size: 1024  # WavLM隐藏层大小
-    n_neurons: 1024   # 保持一致
+# 特征投影层（处理3D张量）
+feature_projection: !new:speechbrain.nnet.containers.Sequential
+    input_shape: [null, null, 1024]  # (batch, time, features)
+    linear: !name:speechbrain.nnet.linear.Linear
+        n_neurons: !ref <emb_dim>
+        bias: True
+    batch_norm: !name:speechbrain.nnet.normalization.BatchNorm1d
+    activation: !name:torch.nn.LeakyReLU
+    dropout: !name:torch.nn.Dropout
+        p: 0.1  # 降低dropout比例，因为是时序数据
 
-# ECAPA-TDNN
+# ECAPA-TDNN（改进版）
 embedding_model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
-    input_size: 1024  # 与投影层输出一致
+    input_size: !ref <emb_dim>
     channels: [1024, 1024, 1024, 1024, 3072]
     kernel_sizes: [5, 3, 3, 3, 1]
     dilations: [1, 2, 3, 4, 1]
-    attention_channels: 128
+    attention_channels: !ref <attention_dim>
     lin_neurons: 192
+    global_context: True  # 启用全局上下文
 
-# 分类器
-classifier: !new:speechbrain.lobes.models.ECAPA_TDNN.Classifier
-    input_size: 192
-    out_neurons: 10  # MSP-PODCAST 10类情感
+# 分类器（带dropout）
+classifier: !new:speechbrain.nnet.containers.Sequential
+    input_shape: [null, 192]
+    dropout: !name:torch.nn.Dropout
+        p: 0.3
+    linear: !name:speechbrain.lobes.models.ECAPA_TDNN.Classifier
+        input_size: 192
+        out_neurons: !ref <num_classes>
 
 # 模块定义
 modules:
@@ -72,45 +101,78 @@ modules:
     embedding_model: !ref <embedding_model>
     classifier: !ref <classifier>
 
-model: !ref <embedding_model>
+model: !new:torch.nn.ModuleList
+    - [!ref <feature_projection>, !ref <embedding_model>, !ref <classifier>]
 
-# 基本损失函数
+# 损失函数（带标签平滑）
 log_softmax: !new:speechbrain.nnet.activations.Softmax
     apply_log: True
 
 compute_cost: !name:speechbrain.nnet.losses.nll_loss
+    label_smoothing: 0.1  # 标签平滑
 
 # 错误计算
-error_stats: !new:speechbrain.utils.metric_stats.MetricStats
+error_stats: !name:speechbrain.utils.metric_stats.MetricStats
     metric: !name:speechbrain.nnet.losses.classification_error
+    n_jobs: 1
 
-# 优化器
-opt_class: !name:torch.optim.Adam
+# 优化器（使用AdamW）
+opt_class: !name:torch.optim.AdamW
     lr: 0.001
+    betas: [0.9, 0.999]
+    weight_decay: 0.0001
 
-model_opt_class: !name:torch.optim.Adam
-    lr: 0.001
+# Learning rate scheduling (improved)
+lr_annealing_model: !new:speechbrain.nnet.schedulers.ReduceLROnPlateau
+    factor: 0.5
+    patience: 3
+    min_lr: 0.00001
+    dont_halve_until_epoch: 5  # Don't reduce LR for first 5 epochs
 
-# 学习率调度
-lr_annealing_model: !new:speechbrain.nnet.schedulers.NewBobScheduler
-    initial_value: 0.001
-    improvement_threshold: 0.0025
-    annealing_factor: 0.8
-    patient: 0
+# Early stopping based on macro-F1
+early_stopper: !new:speechbrain.utils.early_stopping.EarlyStopping
+    patience: 10
+    min_delta: 0.001
 
-# 训练轮数
-number_of_epochs: 20
+# 训练轮数管理
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
     limit: !ref <number_of_epochs>
 
-# 检查点
+# Checkpointer (improved)
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
         model: !ref <model>
-        scheduler_model: !ref <lr_annealing_model>
+        scheduler: !ref <lr_annealing_model>
         counter: !ref <epoch_counter>
+        normalizer: !ref <normalize>
 
-# 日志
+# 日志记录
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
+
+# TensorBoard日志（可选）
+tensorboard_train_logger: !new:speechbrain.utils.train_logger.TensorboardLogger
+    save_dir: !ref <output_folder>/tb_logs
+
+# 特征归一化
+normalize: !new:speechbrain.processing.features.InputNormalization
+    norm_type: global
+    update_until_epoch: 4  # 前4轮更新统计信息
+
+# 梯度裁剪
+gradient_clipping: 5.0
+
+# 混合精度训练（可选）
+use_amp: False  # 如果GPU支持，设置为True
+precision: fp16
+
+# Other advanced options
+sorting: ascending  # Sort by length
+skip_prep: False  # Skip data preparation
+ckpt_interval_minutes: 30  # Save checkpoint every 30 minutes
+
+# Evaluation settings
+eval_interval: 1  # Evaluate every epoch
+save_best_k: 3  # Keep best 3 models
+main_metric: macro_f1  # Main metric for model selection
