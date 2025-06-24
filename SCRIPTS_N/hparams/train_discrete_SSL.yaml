@@ -5,7 +5,7 @@
 # ################################
 
 # Discrete SSL + ECAPA-TDNN with hybrid attention
-seed: 42
+seed: 718
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
 # Results folder
@@ -171,22 +171,33 @@ ssl_model: !apply:speechbrain.utils.hparams.choice
             output_all_hiddens: True
             save_path: !ref <ssl_folder>
 
-# Discrete SSL Codec - 使用新的统一k-means系统
-codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.DiscreteSSL
-    save_path: !ref <kmeans_cache_dir>
-    ssl_model: !ref <ssl_model>
-    kmeans_dataset: !ref <kmeans_dataset>
-    num_clusters: !ref <num_clusters>
-    kmeans_repo_id: speechbrain/SSL_Quantization
+# 暂时注释掉 DiscreteSSL，先测试基础SSL模型
+# Discrete SSL Codec - 暂时禁用进行测试
+# codec: !new:speechbrain.lobes.models.huggingface_transformers.discrete_ssl.DiscreteSSL
+#     save_path: !ref <kmeans_cache_dir>
+#     ssl_model: !ref <ssl_model>
+#     kmeans_dataset: !ref <kmeans_dataset>
+#     num_clusters: !ref <num_clusters>
+#     kmeans_repo_id: speechbrain/SSL_Quantization
 
-# Ultimate Discrete Embedding (IEMOCAP + enhancements)
-discrete_embedding_layer: !new:custom_model.Discrete_EmbeddingLayer
-    num_codebooks: !ref <num_codebooks>
-    vocab_size: !ref <num_clusters>
-    emb_dim: !ref <emb_dim>
-    pad_idx: 0
-    use_positional_encoding: !ref <use_positional_encoding>
-    dropout: !ref <dropout>
+# 简化的embedding层配置，直接使用SSL特征
+ssl_embedding_layer: !new:speechbrain.nnet.linear.Linear
+    input_size: 1024  # WavLM输出维度
+    n_neurons: !ref <emb_dim>
+
+# Ultimate Discrete Embedding (暂时简化)
+# discrete_embedding_layer: !new:custom_model.Discrete_EmbeddingLayer
+#     num_codebooks: !ref <num_codebooks>
+#     vocab_size: !ref <num_clusters>
+#     emb_dim: !ref <emb_dim>
+#     pad_idx: 0
+#     use_positional_encoding: !ref <use_positional_encoding>
+#     dropout: !ref <dropout>
+
+# 简化版本：直接处理SSL特征
+feature_projection: !new:speechbrain.nnet.linear.Linear
+    input_size: 1024  # WavLM hidden size
+    n_neurons: !ref <emb_dim>
 
 # Ultimate Attention MLP (IEMOCAP official + enhancements)
 attention_mlp: !new:custom_model.AttentionMLP
@@ -211,19 +222,20 @@ classifier: !new:speechbrain.lobes.models.ECAPA_TDNN.Classifier
     input_size: 192
     out_neurons: 10  # MSP-PODCAST 10 classes
 
-# Ultimate model combination
+# Ultimate model combination - 简化版本
 modules:
     SSL_layers: !ref <ssl_layer_num>
     ssl_model: !ref <ssl_model>
-    codec: !ref <codec>
-    discrete_embedding_layer: !ref <discrete_embedding_layer>
-    attention_mlp: !ref <attention_mlp>
+    # codec: !ref <codec>  # 暂时移除
+    # discrete_embedding_layer: !ref <discrete_embedding_layer>  # 暂时移除
+    feature_projection: !ref <feature_projection>
+    # attention_mlp: !ref <attention_mlp>  # 暂时移除
     embedding_model: !ref <embedding_model>
     classifier: !ref <classifier>
 
-# Ultimate model for optimization
+# Ultimate model for optimization - 简化版本
 model: !new:torch.nn.ModuleList
-    - [!ref <embedding_model>, !ref <classifier>, !ref <discrete_embedding_layer>, !ref <attention_mlp>]
+    - [!ref <ssl_model>, !ref <feature_projection>, !ref <embedding_model>, !ref <classifier>]
 
 # Loss and metrics
 log_softmax: !new:speechbrain.nnet.activations.Softmax
