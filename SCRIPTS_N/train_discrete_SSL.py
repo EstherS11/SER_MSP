@@ -73,6 +73,7 @@ class MSPPodcastUltimateBrain(sb.Brain):
     
         # 检查是否使用 discrete_ssl
         use_discrete = hasattr(self.hparams, 'use_discrete_ssl') and self.hparams.use_discrete_ssl and hasattr(self.hparams, 'codec')
+    
         if use_discrete:
             # Discrete SSL 代码省略...
             pass
@@ -96,7 +97,7 @@ class MSPPodcastUltimateBrain(sb.Brain):
                     if len(ssl_outputs) == 2:
                         feats, _ = ssl_outputs
                     else:
-                    # 取第一个输出作为特征
+                        # 取第一个输出作为特征
                         feats = ssl_outputs[0]
                 else:
                     # 直接使用返回值作为特征
@@ -105,28 +106,15 @@ class MSPPodcastUltimateBrain(sb.Brain):
                 # 记录特征形状
                 logger.info(f"提取的特征形状: {feats.shape}")
             
-                # 处理特征的维度 - 关键修改部分
-                # 检查特征的维度顺序，确保是 [batch, time, features]
-                if feats.dim() == 3:
-                    # 检查通道维度是哪一个
-                    if feats.shape[1] > feats.shape[2]:  # 如果中间维度大于最后一个维度
-                        # 可能是 [batch, features, time] 格式，需要转置
-                        feats = feats.transpose(1, 2)
-                        logger.info(f"转置后特征形状: {feats.shape}")
+                # 处理4维特征 [batch, channels, time, features]
+                if feats.dim() == 4:
+                    b, c, t, f = feats.shape
+                    # 重塑为3维 [batch, time, features*channels]
+                    feats = feats.permute(0, 2, 1, 3).reshape(b, t, c*f)
+                    logger.info(f"重塑后特征形状: {feats.shape}")
             
                 # 使用特征投影
                 if hasattr(self.modules, 'feature_projection'):
-                    # 确保 feature_projection 的输入维度正确
-                    input_size = self.modules.feature_projection.w.weight.shape[1]
-                    logger.info(f"特征投影输入维度: {input_size}, 特征最后一维: {feats.shape[-1]}")
-                
-                    # 如果特征的最后一维与投影层的输入维度不匹配，创建一个临时适配层
-                    if feats.shape[-1] != input_size:
-                        logger.info(f"创建临时适配层: {feats.shape[-1]} -> {input_size}")
-                        if not hasattr(self, 'temp_adapter'):
-                            self.temp_adapter = torch.nn.Linear(feats.shape[-1], input_size).to(self.device)
-                        feats = self.temp_adapter(feats)
-                
                     # 应用特征投影
                     feats = self.modules.feature_projection(feats)
             
@@ -150,7 +138,7 @@ class MSPPodcastUltimateBrain(sb.Brain):
         except TypeError as e:
             if 'unexpected keyword argument' in str(e):
                 # 如果 embedding_model 不接受 lengths 参数，直接传递特征
-                logger.warning("Embedding model does not accept lengths parameter, using only features")
+                logger.warning("Embedding model does not接受 lengths 参数，仅使用特征")
                 embeddings = self.modules.embedding_model(feats)
             else:
                 raise
@@ -161,15 +149,15 @@ class MSPPodcastUltimateBrain(sb.Brain):
             logger.error(f"Embedding 模型输入尺寸: {getattr(self.modules.embedding_model, 'input_size', 'unknown')}")
             raise
     
-        # Final classification
+    # Final classification
         outputs = self.modules.classifier(embeddings)
         outputs = self.hparams.log_softmax(outputs)
-        
-        # Store attention statistics for analysis (our enhancement)
+    
+    # Store attention statistics for analysis (our enhancement)
         if stage != sb.Stage.TRAIN and hasattr(self, 'store_attention_stats') and self.store_attention_stats:
             self._store_attention_stats(att_w, batch.id)
     
-        return outputs, att_w     
+        return outputs, att_w    
     
    
     def compute_objectives(self, predictions, batch, stage):
