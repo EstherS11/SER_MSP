@@ -5,7 +5,7 @@
 # ################################
 
 # Discrete SSL + ECAPA-TDNN with hybrid attention
-seed: 718
+seed: 42
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
 # Results folder
@@ -199,14 +199,14 @@ feature_projection: !new:speechbrain.nnet.linear.Linear
     input_size: 1024  # WavLM hidden size
     n_neurons: !ref <emb_dim>
 
-# Ultimate Attention MLP (IEMOCAP official + enhancements)
-attention_mlp: !new:custom_model.AttentionMLP
-    input_dim: !ref <emb_dim>
-    hidden_dim: 128
-    output_dim: 1
-    num_codebooks: !ref <num_codebooks>
-    dropout: !ref <dropout>
-    activation: !ref <activation>
+# Ultimate Attention MLP (暂时移除)
+# attention_mlp: !new:custom_model.AttentionMLP
+#     input_dim: !ref <emb_dim>
+#     hidden_dim: 128
+#     output_dim: 1
+#     num_codebooks: !ref <num_codebooks>
+#     dropout: !ref <dropout>
+#     activation: !ref <activation>
 
 # ECAPA-TDNN encoder
 embedding_model: !new:speechbrain.lobes.models.ECAPA_TDNN.ECAPA_TDNN
