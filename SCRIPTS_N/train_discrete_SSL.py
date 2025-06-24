@@ -160,6 +160,21 @@ class MSPPodcastUltimateBrain(sb.Brain):
         # 确保长度值不超过特征的时间步长
         wav_lens = torch.clamp(wav_lens, max=feats.shape[1])
         
+        # 在 compute_forward 方法中，在调用 embedding_model 之前添加这段代码
+        # 检查特征维度是否匹配 embedding_model 的预期输入维度
+        expected_dim = getattr(self.modules.embedding_model, 'input_size', 1024)
+        actual_dim = feats.shape[1]
+
+        if actual_dim != expected_dim:
+            logger.info(f"Adjusting feature dimension from {actual_dim} to {expected_dim}")
+            # 添加一个线性层来调整维度
+            if not hasattr(self, 'dim_adapter'):
+                self.dim_adapter = torch.nn.Linear(actual_dim, expected_dim).to(self.device)
+    
+            # 调整特征维度
+            feats_reshaped = feats.transpose(1, 2)  # [batch, time, channels] -> [batch, channels, time]
+            feats_reshaped = self.dim_adapter(feats_reshaped)  # 调整通道维度
+            feats = feats_reshaped.transpose(1, 2)  # 转回 [batch, time, channels]
         try:
             # ECAPA-TDNN processing
             embeddings = self.modules.embedding_model(feats, wav_lens)
