@@ -31,15 +31,14 @@ class SimpleMSPEmotionBrain(sb.Brain):
     
     def compute_forward(self, batch, stage):
         """Compute forward pass"""
-        # Handle custom batch format
-        if hasattr(batch, 'to'):
-            batch = batch.to(self.device)
-            wavs, wav_lens = batch.sig
-        else:
-            # Custom batch handling
+        # Handle custom batch format (dictionary)
+        if isinstance(batch, dict):
             wavs = batch['sig'][0].to(self.device)
             wav_lens = batch['sig'][1].to(self.device)
-            batch.emo_id = batch['emo_id'].to(self.device)
+        else:
+            # Standard SpeechBrain batch
+            batch = batch.to(self.device)
+            wavs, wav_lens = batch.sig
         
         # Use WavLM to extract features
         with torch.no_grad():
@@ -71,16 +70,18 @@ class SimpleMSPEmotionBrain(sb.Brain):
         """Compute loss and metrics"""
         # Handle both custom and standard batch formats
         if isinstance(batch, dict):
-            emo_ids = batch['emo_id']
+            emo_ids = batch['emo_id'].to(self.device)
+            batch_id = batch['id']
         else:
             emo_ids = batch.emo_id
+            batch_id = batch.id
         
         # Compute loss
         loss = self.hparams.compute_cost(predictions, emo_ids)
         
         # For evaluation stages, compute error rate and collect predictions
         if stage != sb.Stage.TRAIN:
-            self.error_metrics.append(batch.id, predictions, emo_ids)
+            self.error_metrics.append(batch_id, predictions, emo_ids)
             
             # Collect predictions for macro-F1
             pred_labels = predictions.argmax(dim=-1)
