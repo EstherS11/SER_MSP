@@ -202,8 +202,9 @@ ssl_embedding_layer: !new:speechbrain.nnet.linear.Linear
 feature_projection: !new:speechbrain.nnet.linear.Linear
     # input_size: 1024  # WavLM hidden size
     input_size: 2048  # ECAPA-TDNN input size
-    n_neurons: !ref <emb_dim>
-
+    # n_neurons: !ref <emb_dim>
+    n_neurons:  2048
+    
 # Ultimate Attention MLP (暂时移除，避免参数不匹配)
 # attention_mlp: !new:custom_model.AttentionMLP
 #     input_dim: !ref <emb_dim>
