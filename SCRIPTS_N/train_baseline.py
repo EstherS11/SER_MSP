@@ -281,59 +281,58 @@ def dataio_prepare(hparams):
     
     # Audio processing pipeline
     @sb.utils.data_pipeline.takes("wav")
-    @sb.utils.data_pipeline.provides("sig", "length")  # 添加 length
+    @sb.utils.data_pipeline.provides("sig")
     def audio_pipeline(wav):
         try:
-        # 1. Read audio
+            # 1. Read audio
             sig = sb.dataio.dataio.read_audio(wav)
-        
+            
             # 2. Ensure mono audio
             if len(sig.shape) > 1:
+                # Stereo or multi-channel: shape is [channels, samples]
+                # Average across channels
                 sig = torch.mean(sig, dim=0)
-        
+            
             # 3. Ensure 1D tensor
             sig = sig.squeeze()
-        
+            
             # 4. Ensure tensor is not empty
             if sig.shape[0] == 0:
                 logger.warning(f"Empty audio file: {wav}")
                 sig = torch.zeros(int(hparams["sample_rate"]))
-        
+            
             # 5. Check and handle duration
             duration = sig.shape[0] / hparams["sample_rate"]
             min_duration = 0.5
             max_duration = 30
-        
+            
             if duration < min_duration:
+                # Pad short audio
                 pad_length = int(hparams["sample_rate"] * min_duration) - sig.shape[0]
                 sig = torch.nn.functional.pad(sig, (0, pad_length), mode='constant', value=0)
             elif duration > max_duration:
+                # Truncate long audio
                 sig = sig[:int(hparams["sample_rate"] * max_duration)]
-        
+            
             # 6. Normalize
             max_val = sig.abs().max()
             if max_val > 0:
                 sig = sig / max_val * 0.95
-        
+            
             # 7. Ensure correct dtype
             sig = sig.float()
-        
+            
             # Check for NaN or Inf
             if torch.isnan(sig).any() or torch.isinf(sig).any():
                 logger.error(f"Audio contains NaN or Inf: {wav}")
                 sig = torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
-        
-            # 8. 返回音频和长度（这是关键修改）
-            length = torch.tensor(sig.shape[0], dtype=torch.float32)
-            return sig, length
-        
+            
+            return sig
+            
         except Exception as e:
             logger.error(f"Failed to read audio {wav}: {str(e)}")
-            # Return 1 second of silence with length
-            sig = torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
-            length = torch.tensor(sig.shape[0], dtype=torch.float32)
-            return sig, length
-
+            # Return 1 second of silence (1D tensor)
+            return torch.zeros(int(hparams["sample_rate"]), dtype=torch.float32)
     
     # Label processing pipeline
     @sb.utils.data_pipeline.takes("emo")
@@ -378,7 +377,7 @@ def dataio_prepare(hparams):
             json_path=data_info[dataset],
             replacements={"data_root": hparams["data_folder"]},
             dynamic_items=[audio_pipeline, label_pipeline],
-            output_keys=["id", "sig", "length", "emo_id"],
+            output_keys=["id", "sig", "emo_id"],
         )
         logger.info(f"{dataset} dataset size: {len(datasets[dataset])}")
     
@@ -493,12 +492,6 @@ def main():
     # Prepare datasets
     try:
         datasets = dataio_prepare(hparams)
-        # 在 datasets = dataio_prepare(hparams) 之后立即添加：
-        logger.info("Testing data loading...")
-        test_item = datasets["train"][0]
-        logger.info(f"Sample item keys: {test_item.keys()}")
-        logger.info(f"Sig shape: {test_item['sig'].shape if 'sig' in test_item else 'NO SIG'}")
-        logger.info(f"Has length?: {'length' in test_item}")
     except Exception as e:
         logger.error(f"Dataset preparation failed: {e}")
         return
