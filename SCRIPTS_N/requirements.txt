@@ -2,9 +2,9 @@
 # Compatible with Python 3.8-3.11
 
 # Core deep learning frameworks
-torch>=1.13.0,<2.1.0
-torchaudio>=0.13.0,<2.1.0
-torchvision>=0.14.0,<0.16.0
+torch>=2.1.0
+torchaudio>=2.1.0
+torchvision>=0.16.0
 
 # SpeechBrain - main framework
 speechbrain>=0.5.15
