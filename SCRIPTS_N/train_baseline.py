@@ -396,6 +396,55 @@ def dataio_prepare(hparams):
             logger.warning(f"Could not sort dataset: {e}. Using random order.")
             hparams["train_dataloader_opts"]["shuffle"] = True
     
+    # Custom collate function to fix the IndexError
+    def custom_collate_fn(batch):
+        """Custom collate function that handles the batch properly"""
+        from speechbrain.dataio.batch import PaddedData
+        from types import SimpleNamespace
+        
+        # Separate elements
+        ids = [item["id"] for item in batch]
+        sigs = [item["sig"] for item in batch]
+        emo_ids = [item["emo_id"] for item in batch]
+        
+        # Find max length
+        max_len = max(sig.shape[0] for sig in sigs)
+        
+        # Pad all signals to max length
+        padded_sigs = []
+        lengths = []
+        for sig in sigs:
+            orig_len = sig.shape[0]
+            if orig_len < max_len:
+                # Pad with zeros
+                padded = torch.nn.functional.pad(sig, (0, max_len - orig_len))
+            else:
+                padded = sig
+            padded_sigs.append(padded)
+            lengths.append(orig_len)
+        
+        # Convert to tensors
+        sig_tensor = torch.stack(padded_sigs)
+        length_tensor = torch.tensor(lengths, dtype=torch.float32)
+        # Calculate relative lengths (0 to 1)
+        length_tensor = length_tensor / max_len
+        emo_tensor = torch.stack(emo_ids)
+        
+        # Create PaddedData object
+        padded_data = PaddedData(sig_tensor, length_tensor)
+        
+        # Return batch
+        return SimpleNamespace(
+            id=ids,
+            sig=padded_data,
+            emo_id=emo_tensor
+        )
+    
+    # Apply custom collate function
+    hparams["train_dataloader_opts"]["collate_fn"] = custom_collate_fn
+    hparams["valid_dataloader_opts"]["collate_fn"] = custom_collate_fn
+    hparams["test_dataloader_opts"]["collate_fn"] = custom_collate_fn
+    
     return datasets
 
 def check_data_integrity(datasets, hparams):
