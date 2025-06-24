@@ -123,12 +123,28 @@ class MSPPodcastUltimateBrain(sb.Brain):
     
         # 记录最终特征形状
         logger.info(f"最终特征形状: {feats.shape}, 长度形状: {wav_lens.shape}")
-    
+
+        
         # 调整 wav_lens 以确保它与 feats 兼容
         if wav_lens.dim() == 1:
             # 确保长度是相对于特征时间步长的比例
             wav_lens = (wav_lens * feats.shape[1] / wavs.shape[1]).long()
-    
+
+        if wav_lens.shape[0] != feats.shape[0]:
+            logger.warning(f"批量大小不匹配: 特征={feats.shape[0]}, 长度={wav_lens.shape[0]}，正在调整")
+        # 方法1: 复制wav_lens以匹配批量大小
+            if wav_lens.shape[0] == 1:
+        # 如果是标量，直接扩展
+                wav_lens = wav_lens.expand(feats.shape[0])
+            else:
+            # 创建一个新的长度张量，填充为特征长度的比例
+                new_wav_lens = torch.ones(feats.shape[0], device=feats.device)
+        # 使用原始wav_lens的平均值填充
+                new_wav_lens = new_wav_lens * (wav_lens.float().mean() * feats.shape[1] / wavs.shape[1])
+                wav_lens = new_wav_lens.long()
+
+        
+
         # 确保长度值不超过特征的时间步长
         wav_lens = torch.clamp(wav_lens, max=feats.shape[1])
     
