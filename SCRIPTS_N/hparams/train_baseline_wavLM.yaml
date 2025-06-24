@@ -1,4 +1,6 @@
-# 改进的MSP-PODCAST情感分类配置
+# TensorBoard logger (optional)
+tensorboard_train_logger: !new:speechbrain.utils.train_logger.TensorboardLogger
+    save_dir: !ref <output_folder>/tb_logs# 改进的MSP-PODCAST情感分类配置
 seed: 42
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 
@@ -94,15 +96,15 @@ classifier: !new:speechbrain.nnet.containers.Sequential
         input_size: 192
         out_neurons: !ref <num_classes>
 
-# 模块定义
+# Module definitions
 modules:
     ssl_model: !ref <ssl_model>
     feature_projection: !ref <feature_projection>
     embedding_model: !ref <embedding_model>
     classifier: !ref <classifier>
 
-model: !new:torch.nn.ModuleList
-    - [!ref <feature_projection>, !ref <embedding_model>, !ref <classifier>]
+# Define model as the embedding model (for compatibility)
+model: !ref <embedding_model>
 
 # 损失函数（带标签平滑）
 log_softmax: !new:speechbrain.nnet.activations.Softmax
@@ -138,29 +140,24 @@ early_stopper: !new:speechbrain.utils.early_stopping.EarlyStopping
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
     limit: !ref <number_of_epochs>
 
-# Checkpointer (improved)
+# Checkpointer
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
         model: !ref <model>
+        feature_projection: !ref <feature_projection>
+        classifier: !ref <classifier>
         scheduler: !ref <lr_annealing_model>
         counter: !ref <epoch_counter>
-        normalizer: !ref <normalize>
 
 # 日志记录
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
 
-# TensorBoard日志（可选）
-tensorboard_train_logger: !new:speechbrain.utils.train_logger.TensorboardLogger
-    save_dir: !ref <output_folder>/tb_logs
+# Feature normalization (removed - not needed with frozen WavLM)
+# WavLM already provides normalized features
 
-# 特征归一化
-normalize: !new:speechbrain.processing.features.InputNormalization
-    norm_type: global
-    update_until_epoch: 4  # 前4轮更新统计信息
-
-# 梯度裁剪
+# Gradient clipping
 gradient_clipping: 5.0
 
 # 混合精度训练（可选）
