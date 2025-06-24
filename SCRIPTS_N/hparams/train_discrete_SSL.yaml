@@ -199,7 +199,7 @@ feature_projection: !new:speechbrain.nnet.linear.Linear
     input_size: 1024  # WavLM hidden size
     n_neurons: !ref <emb_dim>
 
-# Ultimate Attention MLP (暂时移除)
+# Ultimate Attention MLP (暂时移除，避免参数不匹配)
 # attention_mlp: !new:custom_model.AttentionMLP
 #     input_dim: !ref <emb_dim>
 #     hidden_dim: 128
@@ -255,11 +255,11 @@ lr: !ref <base_lr>
 model_opt_class: !name:torch.optim.Adam
     lr: !ref <base_lr>
 
-# Learning rate scheduling
+# Learning rate scheduling - 修复参数兼容性
 lr_annealing_model: !new:speechbrain.nnet.schedulers.ReduceLROnPlateau
     factor: 0.8
     patience: 3
-    min_lr: 0.00001
+    # min_lr: 0.00001  # 移除不兼容的参数
 
 # Learning rate scheduling configuration
 lr_scheduling_metric: 'primary_metric'  # Use primary metric for LR scheduling
