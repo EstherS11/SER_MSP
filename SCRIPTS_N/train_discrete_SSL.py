@@ -3,6 +3,13 @@
 Ultimate training script for MSP-PODCAST emotion recognition using discrete SSL
 Fusion of IEMOCAP official implementation + advanced features + MSP-PODCAST adaptations
 
+Version: 1.1.0
+Last Updated: 2025-06-24
+Changes:
+- Added support for non-discrete SSL mode
+- Enhanced error handling for feature dimension issues
+- Improved compatibility with different embedding model implementations
+
 Key Features:
 - IEMOCAP official attention computation (matrix multiplication)
 - Proper codec calling with tokenizer_config
@@ -56,7 +63,6 @@ class MSPPodcastUltimateBrain(sb.Brain):
         self.best_valid_acc = 0.0
         self.codec_cache = None  # Cache codec for efficiency
         
-   
     def compute_forward(self, batch, stage):
         """
         Forward computation using IEMOCAP official approach + enhancements
@@ -90,16 +96,24 @@ class MSPPodcastUltimateBrain(sb.Brain):
             # IEMOCAP official attention computation (THE KEY DIFFERENCE!)
             att_w = self.modules.attention_mlp(embeddings)
         
-        # IEMOCAP's elegant matrix multiplication approach
-        # att_w: [batch, time, num_codebooks, 1]
-        # embeddings: [batch, time, num_codebooks, emb_dim]
-        # Result: [batch, time, emb_dim]
+            # IEMOCAP's elegant matrix multiplication approach
+            # att_w: [batch, time, num_codebooks, 1]
+            # embeddings: [batch, time, num_codebooks, emb_dim]
+            # Result: [batch, time, emb_dim]
             feats = torch.matmul(att_w.transpose(2, -1), embeddings).squeeze(-2)
         else:
             # 直接使用 SSL 模型路径
             with torch.no_grad():
-            # 提取 SSL 特征 - 处理不同的返回格式
+                # 提取 SSL 特征 - 处理不同的返回格式
                 ssl_outputs = self.modules.ssl_model(wavs)
+                
+                # 记录 SSL 输出类型和形状，用于调试
+                if isinstance(ssl_outputs, tuple):
+                    logger.debug(f"SSL model output is tuple with length {len(ssl_outputs)}")
+                    if len(ssl_outputs) > 0:
+                        logger.debug(f"First element shape: {ssl_outputs[0].shape}")
+                else:
+                    logger.debug(f"SSL model output shape: {ssl_outputs.shape}")
             
                 # 根据返回类型处理特征
                 if isinstance(ssl_outputs, tuple):
@@ -145,8 +159,9 @@ class MSPPodcastUltimateBrain(sb.Brain):
     
         # 确保长度值不超过特征的时间步长
         wav_lens = torch.clamp(wav_lens, max=feats.shape[1])
+        
         try:
-        # ECAPA-TDNN processing
+            # ECAPA-TDNN processing
             embeddings = self.modules.embedding_model(feats, wav_lens)
         except TypeError as e:
             if 'unexpected keyword argument' in str(e):
@@ -156,7 +171,7 @@ class MSPPodcastUltimateBrain(sb.Brain):
             else:
                 raise
     
-    # Final classification
+        # Final classification
         outputs = self.modules.classifier(embeddings)
         outputs = self.hparams.log_softmax(outputs)
     
@@ -165,9 +180,6 @@ class MSPPodcastUltimateBrain(sb.Brain):
             self._store_attention_stats(att_w, batch.id)
     
         return outputs, att_w
-
-
-
    
     def compute_objectives(self, predictions, batch, stage):
         """
@@ -381,25 +393,52 @@ class MSPPodcastUltimateBrain(sb.Brain):
     
     def _store_attention_stats(self, attention_weights, batch_ids):
         """Store attention statistics for analysis (our enhancement)"""
+        # 确保 attention_weights 有适当的维度
         if attention_weights.dim() == 4:
             attention_weights = attention_weights.squeeze(-1)
+        elif attention_weights.dim() < 3:
+            # 如果维度太少，添加必要的维度
+            while attention_weights.dim() < 3:
+                attention_weights = attention_weights.unsqueeze(-1)
+        
+        # 检查注意力权重的形状是否合理
+        if hasattr(self.hparams, 'num_codebooks') and attention_weights.shape[-1] != self.hparams.num_codebooks:
+            # 如果不匹配，创建一个虚拟的注意力权重
+            logger.warning(f"Attention weights shape {attention_weights.shape} is not compatible with num_codebooks {self.hparams.num_codebooks}. Using uniform weights.")
+            # 假设形状是 [batch, time, ?]
+            b, t = attention_weights.shape[0], attention_weights.shape[1]
+            attention_weights = torch.ones((b, t, self.hparams.num_codebooks), device=attention_weights.device) / self.hparams.num_codebooks
         
         # Compute mean attention across time
         mean_attention = attention_weights.mean(dim=1)  # [batch, num_codebooks]
         
         for i, batch_id in enumerate(batch_ids):
-            self.attention_stats.append({
-                'id': batch_id,
-                'attention_weights': mean_attention[i].cpu().numpy(),
-                'attention_entropy': self._compute_entropy(mean_attention[i:i+1]).item(),
-                'dominant_codebook': mean_attention[i].argmax().item()
-            })
+            # 确保索引在有效范围内
+            if i < mean_attention.shape[0]:
+                # 确保我们可以安全地计算熵和获取主要的代码本
+                if mean_attention.shape[1] > 0:
+                    self.attention_stats.append({
+                        'id': batch_id,
+                        'attention_weights': mean_attention[i].cpu().numpy(),
+                        'attention_entropy': self._compute_entropy(mean_attention[i:i+1]).item(),
+                        'dominant_codebook': mean_attention[i].argmax().item()
+                    })
+                else:
+                    # 如果没有多个代码本，使用占位符
+                    self.attention_stats.append({
+                        'id': batch_id,
+                        'attention_weights': np.array([1.0]),
+                        'attention_entropy': 0.0,
+                        'dominant_codebook': 0
+                    })
     
     def _compute_entropy(self, attention_weights):
         """Compute entropy of attention distribution"""
         epsilon = 1e-8
-        log_weights = torch.log(attention_weights + epsilon)
-        entropy = -(attention_weights * log_weights).sum(dim=-1)
+        # 确保权重是正数并且总和为1
+        norm_weights = torch.nn.functional.softmax(attention_weights, dim=-1) + epsilon
+        log_weights = torch.log(norm_weights)
+        entropy = -(norm_weights * log_weights).sum(dim=-1)
         return entropy
     
     def _log_attention_analysis(self, stage, stats):
@@ -407,21 +446,29 @@ class MSPPodcastUltimateBrain(sb.Brain):
         if not self.attention_stats:
             return
         
-        attention_arrays = np.array([s['attention_weights'] for s in self.attention_stats])
-        entropies = [s['attention_entropy'] for s in self.attention_stats]
-        
-        # Compute statistics
-        mean_attention = attention_arrays.mean(axis=0)
-        std_attention = attention_arrays.std(axis=0)
-        mean_entropy = np.mean(entropies)
-        
-        logger.info(f"\n📊 {stage.upper()} Attention Analysis:")
-        logger.info(f"   Mean entropy: {mean_entropy:.4f}")
-        
-        # Log SSL layer importance
-        ssl_layers = [1, 3, 7, 12, 18, 23]
-        for i, (layer, attention) in enumerate(zip(ssl_layers, mean_attention)):
-            logger.info(f"   Layer {layer:2d}: {attention:.4f} ± {std_attention[i]:.4f}")
+        try:
+            attention_arrays = np.array([s['attention_weights'] for s in self.attention_stats])
+            entropies = [s['attention_entropy'] for s in self.attention_stats]
+            
+            # Compute statistics
+            mean_attention = attention_arrays.mean(axis=0)
+            std_attention = attention_arrays.std(axis=0)
+            mean_entropy = np.mean(entropies)
+            
+            logger.info(f"\n📊 {stage.upper()} Attention Analysis:")
+            logger.info(f"   Mean entropy: {mean_entropy:.4f}")
+            
+            # Log SSL layer importance if compatible
+            if hasattr(self.hparams, 'ssl_layer_num'):
+                ssl_layers = self.hparams.ssl_layer_num
+                # 确保我们有足够的层来记录
+                if len(ssl_layers) == mean_attention.shape[0]:
+                    for i, (layer, attention) in enumerate(zip(ssl_layers, mean_attention)):
+                        logger.info(f"   Layer {layer:2d}: {attention:.4f} ± {std_attention[i]:.4f}")
+                else:
+                    logger.warning(f"Number of SSL layers ({len(ssl_layers)}) doesn't match attention dimensions ({mean_attention.shape[0]})")
+        except Exception as e:
+            logger.error(f"Error in attention analysis: {e}")
     
     def _export_final_analysis(self, test_stats):
         """Export comprehensive analysis to files"""
@@ -572,6 +619,12 @@ def main():
     """
     Main training function using IEMOCAP official structure + enhancements
     """
+    # 设置详细的日志级别
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    )
+    
     logger.info("🚀 Starting Ultimate MSP-PODCAST Discrete SSL Training")
     logger.info("   Based on IEMOCAP official implementation + enhancements")
     
