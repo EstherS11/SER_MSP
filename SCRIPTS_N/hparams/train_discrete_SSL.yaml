@@ -222,20 +222,15 @@ classifier: !new:speechbrain.lobes.models.ECAPA_TDNN.Classifier
     input_size: 192
     out_neurons: 10  # MSP-PODCAST 10 classes
 
-# Ultimate model combination - 简化版本
+# Ultimate model combination - 修复模块类型错误
 modules:
-    SSL_layers: !ref <ssl_layer_num>
     ssl_model: !ref <ssl_model>
-    # codec: !ref <codec>  # 暂时移除
-    # discrete_embedding_layer: !ref <discrete_embedding_layer>  # 暂时移除
     feature_projection: !ref <feature_projection>
-    # attention_mlp: !ref <attention_mlp>  # 暂时移除
     embedding_model: !ref <embedding_model>
     classifier: !ref <classifier>
 
-# Ultimate model for optimization - 简化版本
-model: !new:torch.nn.ModuleList
-    - [!ref <ssl_model>, !ref <feature_projection>, !ref <embedding_model>, !ref <classifier>]
+# Ultimate model for optimization - 修复 list 不是 Module 的错误
+model: !ref <embedding_model>  # 只使用主要的embedding模型进行优化
 
 # Loss and metrics
 log_softmax: !new:speechbrain.nnet.activations.Softmax
