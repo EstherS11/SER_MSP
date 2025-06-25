@@ -10,7 +10,39 @@ import numpy as np
 from sklearn.metrics import f1_score, classification_report
 from transformers import WavLMModel
 import warnings
+import time
+import sys
+from datetime import datetime
+from tqdm import tqdm
+import psutil
+import logging
 warnings.filterwarnings('ignore')
+
+# ============= 设置详细日志 =============
+def setup_logging(log_file):
+    """设置详细的日志记录"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger(__name__)
+
+def get_system_info():
+    """获取系统资源信息"""
+    cpu_percent = psutil.cpu_percent(interval=1)
+    memory = psutil.virtual_memory()
+    
+    gpu_info = ""
+    if torch.cuda.is_available():
+        gpu_memory_used = torch.cuda.memory_allocated() / 1024**3
+        gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_info = f"GPU Memory: {gpu_memory_used:.1f}/{gpu_memory_total:.1f}GB"
+    
+    return f"CPU: {cpu_percent}% | RAM: {memory.percent}% | {gpu_info}"
 
 # ============= Focal Loss Implementation =============
 class FocalLoss(nn.Module):
@@ -39,7 +71,7 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
 
-# ECAPA-TDNN Components - 保持原始实现
+# ECAPA-TDNN Components
 class SE_Res2Block(nn.Module):
     """Squeeze-Excitation Res2Block used in ECAPA-TDNN"""
     def __init__(self, in_channels, out_channels, res2_scale=8, se_channels=128, kernel_size=3):
@@ -128,7 +160,7 @@ class AttentiveStatisticsPooling(nn.Module):
         
         return pooled
 
-# ============= 1. Hierarchical Model Architecture - 使用你的方案 =============
+# ============= Hierarchical Model Architecture =============
 class HierarchicalWavLMECAPAClassifier(nn.Module):
     """
     Serial/Hierarchical Architecture: WavLM -> ECAPA-TDNN -> Classifier
@@ -147,21 +179,19 @@ class HierarchicalWavLMECAPAClassifier(nn.Module):
         wavlm_dim = 1024  # WavLM-large output dimension
         ecapa_dim = 512   # The internal dimension for ECAPA blocks
         
-        # 新增: 输入投影层，将WavLM的1024维映射到ECAPA的512维
+        # 输入投影层，将WavLM的1024维映射到ECAPA的512维
         self.input_projection = nn.Sequential(
             nn.Conv1d(wavlm_dim, ecapa_dim, kernel_size=1),
             nn.BatchNorm1d(ecapa_dim),
             nn.ReLU()
         )
         
-        # ECAPA-TDNN components (simplified version without MFCC extraction)
-        # Based on the ECAPA-TDNN architecture but adapted for feature input
+        # ECAPA-TDNN components
         self.ecapa_encoder = nn.ModuleDict({
-            # 修改: layer1的输入通道现在是ecapa_dim (512)
             'layer1': SE_Res2Block(ecapa_dim, ecapa_dim, res2_scale=4, se_channels=128, kernel_size=3),
             'layer2': SE_Res2Block(ecapa_dim, ecapa_dim, res2_scale=4, se_channels=128, kernel_size=3),
             'layer3': SE_Res2Block(ecapa_dim, ecapa_dim, res2_scale=4, se_channels=128, kernel_size=3),
-            'layer4': nn.Conv1d(ecapa_dim, 1536, kernel_size=1), # 从512扩展到1536
+            'layer4': nn.Conv1d(ecapa_dim, 1536, kernel_size=1),
         })
         
         # Attentive Statistics Pooling
@@ -181,35 +211,33 @@ class HierarchicalWavLMECAPAClassifier(nn.Module):
         
     def forward(self, waveform):
         # 1. WavLM feature extraction
-        # Output: [Batch, Time, 1024]
         wavlm_features = self.wavlm(waveform).last_hidden_state
         
         # 2. Transpose for CNN processing: [Batch, 1024, Time]
         features = wavlm_features.transpose(1, 2)
         
-        # 新增: 应用输入投影层
+        # 3. 应用输入投影层
         projected_features = self.input_projection(features)
         
-        # 3. ECAPA encoding (从投影后的特征开始)
-        # 修改: 将projected_features送入layer1
+        # 4. ECAPA encoding
         x = self.ecapa_encoder['layer1'](projected_features)
         x = self.ecapa_encoder['layer2'](x)
         x = self.ecapa_encoder['layer3'](x)
         x = self.ecapa_encoder['layer4'](x)
         
-        # 4. Attentive Statistics Pooling
+        # 5. Attentive Statistics Pooling
         pooled = self.asp(x)
         
-        # 5. Final embedding
+        # 6. Final embedding
         emb = self.fc_emb(pooled)
         emb = self.bn_emb(emb)
         
-        # 6. Classification
+        # 7. Classification
         logits = self.classifier(emb)
         
         return logits
 
-# ============= 2. Enhanced Data Augmentation =============
+# ============= Enhanced Data Augmentation =============
 class AudioAugmentationPipeline:
     """Professional audio augmentation pipeline"""
     def __init__(self, sample_rate=16000):
@@ -289,7 +317,7 @@ class AudioAugmentationPipeline:
             
         return waveform
 
-# ============= 3. Efficient Dataset with Dynamic Padding =============
+# ============= Efficient Dataset with Dynamic Padding =============
 class EfficientMSPDataset(Dataset):
     """Dataset with efficient loading and augmentation"""
     def __init__(self, json_path, root_dir, augment=False, sample_rate=16000):
@@ -359,15 +387,24 @@ def collate_fn_padd(batch):
     
     return waveforms_padded, labels, lengths
 
-# ============= Training Script =============
+# ============= Training Script with Enhanced Monitoring =============
 def train_improved_model():
-    print("Starting training with improved hierarchical architecture...")
+    # 设置详细日志
+    log_file = f"logs/detailed_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logger = setup_logging(log_file)
+    
+    logger.info("🚀 Starting training with enhanced monitoring...")
+    logger.info(f"🕐 Training started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    logger.info(f"🔧 Using device: {device}")
     
-    batch_size = 16
+    if torch.cuda.is_available():
+        logger.info(f"🔧 GPU: {torch.cuda.get_device_name(0)}")
+        logger.info(f"🔧 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+    
+    batch_size = 16  # 减小batch size以获得更频繁的更新
     learning_rate = 1e-4
     num_epochs = 50
     
@@ -377,31 +414,35 @@ def train_improved_model():
     else:
         root_dir = '/Users/esthersun/Desktop/SER/SER_MSP'
     
-    print(f"Data directory: {root_dir}")
+    logger.info(f"📁 Data directory: {root_dir}")
     
     # Create datasets with efficient loading
+    logger.info("🔄 Loading training dataset...")
     train_dataset = EfficientMSPDataset(
         os.path.join(root_dir, 'msp_train_10class.json'),
         root_dir,
         augment=True
     )
     
+    logger.info("🔄 Loading validation dataset...")
     valid_dataset = EfficientMSPDataset(
         os.path.join(root_dir, 'msp_valid_10class.json'),
         root_dir,
         augment=False
     )
     
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(valid_dataset)}")
+    logger.info(f"📊 Training samples: {len(train_dataset):,}")
+    logger.info(f"📊 Validation samples: {len(valid_dataset):,}")
+    logger.info(f"📊 Batches per epoch: {len(train_dataset) // batch_size:,}")
     
     # Create dataloaders with custom collate function
+    logger.info("🔄 Creating data loaders...")
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn_padd,
-        num_workers=4,
+        num_workers=4,  # 可以根据需要调整
         pin_memory=True
     )
     
@@ -414,17 +455,24 @@ def train_improved_model():
         pin_memory=True
     )
     
+    logger.info("✅ Data loaders created successfully")
+    
     # Initialize model
-    print("Initializing HierarchicalWavLMECAPAClassifier...")
+    logger.info("🔄 Initializing HierarchicalWavLMECAPAClassifier...")
+    model_start_time = time.time()
     model = HierarchicalWavLMECAPAClassifier(num_classes=10).to(device)
+    model_init_time = time.time() - model_start_time
+    logger.info(f"✅ Model initialized in {model_init_time:.2f} seconds")
     
     # Print model architecture
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    logger.info(f"📊 Total parameters: {total_params:,}")
+    logger.info(f"📊 Trainable parameters: {trainable_params:,}")
+    logger.info(f"📊 Frozen parameters: {total_params - trainable_params:,}")
     
     # Calculate class weights for focal loss
+    logger.info("🔄 Calculating class weights...")
     emotion_counts = {}
     for item in train_dataset.data.values():
         emo = train_dataset.emotion_map[item['emo']]
@@ -436,10 +484,10 @@ def train_improved_model():
         for i in range(10)
     ]).to(device)
     
-    print("Class distribution:")
+    logger.info("📊 Class distribution:")
     emotion_names = ['N', 'H', 'S', 'A', 'F', 'D', 'U', 'C', 'O', 'X']
     for i, (name, count) in enumerate(zip(emotion_names, [emotion_counts.get(i, 0) for i in range(10)])):
-        print(f"  {name}: {count} samples (weight: {class_weights[i]:.3f})")
+        logger.info(f"  {name}: {count:,} samples (weight: {class_weights[i]:.3f})")
     
     # Loss and optimizer
     criterion = FocalLoss(alpha=class_weights, gamma=2.0)
@@ -452,19 +500,32 @@ def train_improved_model():
         pct_start=0.1
     )
     
-    print(f"Starting training for {num_epochs} epochs...")
-    print("=" * 60)
+    logger.info(f"🎯 Starting training for {num_epochs} epochs...")
+    logger.info("=" * 80)
     
     # Training loop
     best_valid_f1 = 0
+    total_training_time = 0
+    
     for epoch in range(num_epochs):
+        epoch_start_time = time.time()
+        logger.info(f"🔄 Epoch {epoch+1}/{num_epochs} started")
+        logger.info(f"📊 {get_system_info()}")
+        
         # Train
         model.train()
         train_loss = 0
         train_preds = []
         train_labels = []
         
-        for batch_idx, (waveforms, labels, lengths) in enumerate(train_loader):
+        # 使用tqdm显示训练进度
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} Training", 
+                         leave=False, file=sys.stdout)
+        
+        batch_times = []
+        for batch_idx, (waveforms, labels, lengths) in enumerate(train_pbar):
+            batch_start_time = time.time()
+            
             waveforms = waveforms.to(device)
             labels = labels.to(device)
             
@@ -484,18 +545,44 @@ def train_improved_model():
             train_preds.extend(preds.cpu().numpy())
             train_labels.extend(labels.cpu().numpy())
             
-            # Print progress every 50 batches
+            batch_time = time.time() - batch_start_time
+            batch_times.append(batch_time)
+            
+            # 更新进度条
+            avg_batch_time = np.mean(batch_times[-50:])  # 最近50个batch的平均时间
+            eta_seconds = avg_batch_time * (len(train_loader) - batch_idx - 1)
+            eta_minutes = eta_seconds / 60
+            
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Batch_time': f'{batch_time:.2f}s',
+                'ETA': f'{eta_minutes:.1f}min'
+            })
+            
+            # 每50个batch详细记录一次
             if (batch_idx + 1) % 50 == 0:
-                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx+1}/{len(train_loader)}, Loss: {loss.item():.4f}")
+                current_lr = scheduler.get_last_lr()[0]
+                logger.info(f"  📍 Batch {batch_idx+1}/{len(train_loader)} | "
+                          f"Loss: {loss.item():.4f} | "
+                          f"LR: {current_lr:.2e} | "
+                          f"Batch time: {batch_time:.2f}s | "
+                          f"ETA: {eta_minutes:.1f}min | "
+                          f"{get_system_info()}")
+        
+        train_pbar.close()
         
         # Validation
+        logger.info("🔄 Starting validation...")
         model.eval()
         valid_loss = 0
         valid_preds = []
         valid_labels = []
         
+        valid_pbar = tqdm(valid_loader, desc=f"Epoch {epoch+1} Validation", 
+                         leave=False, file=sys.stdout)
+        
         with torch.no_grad():
-            for waveforms, labels, lengths in valid_loader:
+            for batch_idx, (waveforms, labels, lengths) in enumerate(valid_pbar):
                 waveforms = waveforms.to(device)
                 labels = labels.to(device)
                 
@@ -506,41 +593,58 @@ def train_improved_model():
                 preds = torch.argmax(outputs, dim=1)
                 valid_preds.extend(preds.cpu().numpy())
                 valid_labels.extend(labels.cpu().numpy())
+                
+                valid_pbar.set_postfix({'Val_Loss': f'{loss.item():.4f}'})
+        
+        valid_pbar.close()
         
         # Calculate metrics
         train_f1 = f1_score(train_labels, train_preds, average='macro')
         valid_f1 = f1_score(valid_labels, valid_preds, average='macro')
         
-        print(f"\nEpoch {epoch+1}/{num_epochs} Results:")
-        print(f"Train Loss: {train_loss/len(train_loader):.4f}, Train F1: {train_f1:.4f}")
-        print(f"Valid Loss: {valid_loss/len(valid_loader):.4f}, Valid F1: {valid_f1:.4f}")
-        print(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
+        epoch_time = time.time() - epoch_start_time
+        total_training_time += epoch_time
+        
+        # 详细的epoch总结
+        logger.info(f"\n🎯 Epoch {epoch+1}/{num_epochs} Results:")
+        logger.info(f"  ⏱️ Epoch time: {epoch_time/60:.2f} minutes")
+        logger.info(f"  📊 Train Loss: {train_loss/len(train_loader):.4f} | Train F1: {train_f1:.4f}")
+        logger.info(f"  📊 Valid Loss: {valid_loss/len(valid_loader):.4f} | Valid F1: {valid_f1:.4f}")
+        logger.info(f"  📊 Learning Rate: {scheduler.get_last_lr()[0]:.2e}")
+        logger.info(f"  📊 Total training time: {total_training_time/3600:.2f} hours")
+        logger.info(f"  📊 {get_system_info()}")
         
         # Save best model
         if valid_f1 > best_valid_f1:
             best_valid_f1 = valid_f1
-            torch.save({
+            checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'best_valid_f1': best_valid_f1,
                 'class_weights': class_weights,
-            }, 'hierarchical_best_model.pth')
-            print(f"✓ Saved best model with Valid F1: {best_valid_f1:.4f}")
+                'train_f1': train_f1,
+                'valid_f1': valid_f1,
+                'total_training_time': total_training_time,
+            }
+            torch.save(checkpoint, 'hierarchical_best_model.pth')
+            logger.info(f"  ✅ Saved best model with Valid F1: {best_valid_f1:.4f}")
         
-        print("-" * 60)
+        logger.info("-" * 80)
     
-    print("Training completed!")
-    print(f"Best validation F1 score: {best_valid_f1:.4f}")
+    logger.info("🎉 Training completed!")
+    logger.info(f"🏆 Best validation F1 score: {best_valid_f1:.4f}")
+    logger.info(f"⏱️ Total training time: {total_training_time/3600:.2f} hours")
     
     # Final evaluation with detailed classification report
+    logger.info("🔄 Final evaluation...")
     model.eval()
     all_preds = []
     all_labels = []
     
     with torch.no_grad():
-        for waveforms, labels, lengths in valid_loader:
+        for waveforms, labels, lengths in tqdm(valid_loader, desc="Final Evaluation"):
             waveforms = waveforms.to(device)
             labels = labels.to(device)
             
@@ -549,10 +653,11 @@ def train_improved_model():
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     
-    print("\nFinal Classification Report:")
-    print(classification_report(all_labels, all_preds, 
-                              target_names=emotion_names, 
-                              digits=4))
+    logger.info("\n📊 Final Classification Report:")
+    report = classification_report(all_labels, all_preds, 
+                                 target_names=emotion_names, 
+                                 digits=4)
+    logger.info(f"\n{report}")
 
 if __name__ == "__main__":
     train_improved_model()
