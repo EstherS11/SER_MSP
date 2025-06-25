@@ -11,6 +11,34 @@ from sklearn.metrics import f1_score, classification_report
 from transformers import WavLMModel
 import warnings
 warnings.filterwarnings('ignore')
+# ============= Focal Loss Implementation =============
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing class imbalance"""
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            at = self.alpha.gather(0, targets)
+            focal_loss = at * focal_loss
+            
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
 
 # ============= 1. Hierarchical Model Architecture =============
 class HierarchicalWavLMECAPAClassifier(nn.Module):
@@ -382,7 +410,7 @@ def train_improved_model():
     ]).to(device)
     
     # Loss and optimizer
-    from train_msp_podcast import FocalLoss
+
     criterion = FocalLoss(alpha=class_weights, gamma=2.0)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
