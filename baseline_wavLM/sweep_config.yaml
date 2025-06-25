@@ -1,0 +1,69 @@
+# sweep_config_fixed.yaml
+# Fixed W&B Sweep configuration for MSP-PODCAST emotion recognition
+
+program: enhanced_quick_train.py
+method: bayes  # Can be: grid, random, bayes
+metric:
+  name: best_valid_f1
+  goal: maximize
+
+parameters:
+  # Model parameters
+  freeze_wavlm:
+    values: [true, false]
+  
+  hidden_size:
+    distribution: int_uniform
+    min: 128
+    max: 512
+  
+  dropout:
+    distribution: uniform
+    min: 0.1
+    max: 0.5
+  
+  # Training parameters
+  batch_size:
+    values: [8, 16, 32]
+  
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.001
+  
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.0001
+  
+  # Loss parameters
+  focal_gamma:
+    distribution: uniform
+    min: 1.0
+    max: 3.0
+  
+  use_class_weights:
+    values: [true, false]
+  
+  # Data augmentation
+  augment:
+    values: [true, false]
+  
+  augment_prob:
+    distribution: uniform
+    min: 0.3
+    max: 0.8
+  
+  # Optimizer
+  optimizer:
+    values: ['adam', 'adamw', 'sgd']
+  
+  # Learning rate scheduler
+  scheduler:
+    values: ['plateau', 'cosine', 'onecycle']
+
+early_terminate:
+  type: hyperband
+  s: 2
+  eta: 3
+  max_iter: 50

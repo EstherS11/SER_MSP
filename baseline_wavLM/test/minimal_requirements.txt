@@ -1,0 +1,11 @@
+# Core dependencies
+torch>=1.10.0
+torchaudio>=0.10.0
+numpy>=1.19.0
+scikit-learn>=0.24.0
+tqdm>=4.62.0
+matplotlib>=3.3.0
+
+# Optional dependencies (required for pretrained models)
+# transformers>=4.20.0
+# speechbrain>=0.5.0
