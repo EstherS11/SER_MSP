@@ -1,8 +1,6 @@
-# ============================================================================
-# 文件1: espnet_ser_model.py - ESP-net兼容的WavLM + ECAPA-TDNN模型
-# ============================================================================
-
 #!/usr/bin/env python3
+# espnet_ser_model.py - ESP-net兼容的WavLM + ECAPA-TDNN模型
+
 import logging
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -14,6 +12,8 @@ from sklearn.metrics import f1_score, classification_report
 import numpy as np
 
 from espnet2.train.abs_espnet_model import AbsESPnetModel
+from espnet2.tasks.abs_task import AbsTask
+from espnet2.train.class_choices import ClassChoices
 from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
 
 class SERes2NetBlock(nn.Module):
@@ -154,9 +154,9 @@ class WavLMECAPAModel(AbsESPnetModel):
         wavlm_freeze: bool = True,
         
         # ECAPA-TDNN配置
-        ecapa_channels: List[int] = [512, 512, 512],
-        ecapa_kernels: List[int] = [5, 3, 3],
-        ecapa_dilations: List[int] = [1, 2, 3],
+        ecapa_channels: List[int] = None,
+        ecapa_kernels: List[int] = None,
+        ecapa_dilations: List[int] = None,
         context_dim: int = 1536,
         embedding_dim: int = 256,
         
@@ -170,6 +170,14 @@ class WavLMECAPAModel(AbsESPnetModel):
         save_macro_f1: bool = True,
     ):
         super().__init__()
+        
+        # 默认值
+        if ecapa_channels is None:
+            ecapa_channels = [512, 512, 512]
+        if ecapa_kernels is None:
+            ecapa_kernels = [5, 3, 3]
+        if ecapa_dilations is None:
+            ecapa_dilations = [1, 2, 3]
         
         self.num_class = num_class
         self.save_macro_f1 = save_macro_f1
@@ -230,7 +238,6 @@ class WavLMECAPAModel(AbsESPnetModel):
         
         # 损失函数
         if loss_type == "focal":
-            from .focal_loss import FocalLoss  # 需要实现FocalLoss
             weights = torch.tensor(class_weights) if class_weights else None
             self.criterion = FocalLoss(alpha=weights, gamma=focal_gamma)
         else:
@@ -380,3 +387,111 @@ class WavLMECAPAModel(AbsESPnetModel):
         l = _conv_out_length(l, 2, 2, 0)     # 第7层
         
         return l.long()
+
+
+# ============================================================================
+# SER任务类 - ESP-net集成
+# ============================================================================
+
+class SERTask(AbsTask):
+    """Speech Emotion Recognition Task for ESP-net"""
+    
+    num_optimizers: int = 1
+    
+    @classmethod
+    def add_task_arguments(cls, parser):
+        """添加SER任务特定参数"""
+        group = parser.add_argument_group("SER task related")
+        group.add_argument("--num_class", type=int, default=10, help="Number of emotion classes")
+        
+        # 模型参数
+        group.add_argument("--wavlm_model_name", type=str, default="microsoft/wavlm-large")
+        group.add_argument("--wavlm_freeze", type=bool, default=True)
+        group.add_argument("--ecapa_channels", type=int, nargs="+", default=[512, 512, 512])
+        group.add_argument("--ecapa_kernels", type=int, nargs="+", default=[5, 3, 3])
+        group.add_argument("--ecapa_dilations", type=int, nargs="+", default=[1, 2, 3])
+        group.add_argument("--context_dim", type=int, default=1536)
+        group.add_argument("--embedding_dim", type=int, default=256)
+        group.add_argument("--loss_type", type=str, default="cross_entropy")
+        group.add_argument("--focal_gamma", type=float, default=2.0)
+        group.add_argument("--label_smoothing", type=float, default=0.0)
+        group.add_argument("--save_macro_f1", type=bool, default=True)
+        
+    @classmethod
+    def build_model(cls, args):
+        """构建模型"""
+        model_conf = getattr(args, 'model_conf', {})
+        
+        return WavLMECAPAModel(
+            num_class=getattr(args, 'num_class', 10),
+            wavlm_model_name=getattr(args, 'wavlm_model_name', "microsoft/wavlm-large"),
+            wavlm_freeze=getattr(args, 'wavlm_freeze', True),
+            ecapa_channels=getattr(args, 'ecapa_channels', [512, 512, 512]),
+            ecapa_kernels=getattr(args, 'ecapa_kernels', [5, 3, 3]),
+            ecapa_dilations=getattr(args, 'ecapa_dilations', [1, 2, 3]),
+            context_dim=getattr(args, 'context_dim', 1536),
+            embedding_dim=getattr(args, 'embedding_dim', 256),
+            loss_type=getattr(args, 'loss_type', "cross_entropy"),
+            focal_gamma=getattr(args, 'focal_gamma', 2.0),
+            label_smoothing=getattr(args, 'label_smoothing', 0.0),
+            save_macro_f1=getattr(args, 'save_macro_f1', True),
+            **model_conf
+        )
+    
+    @classmethod
+    def required_data_names(cls, inference: bool = False):
+        """必需的数据名称"""
+        if not inference:
+            return ("speech", "emotion")
+        else:
+            return ("speech",)
+    
+    @classmethod
+    def optional_data_names(cls, inference: bool = False):
+        """可选的数据名称"""
+        return ()
+
+
+# ============================================================================
+# Focal Loss实现
+# ============================================================================
+
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing class imbalance"""
+    
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        
+        if self.alpha is not None:
+            if self.alpha.device != focal_loss.device:
+                self.alpha = self.alpha.to(focal_loss.device)
+            focal_loss = self.alpha[targets] * focal_loss
+            
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+# ============================================================================
+# 模型选择注册
+# ============================================================================
+
+ser_model_choices = ClassChoices(
+    name="ser_model",
+    classes=dict(
+        wavlm_ecapa=WavLMECAPAModel,
+    ),
+    type_check=AbsESPnetModel,
+    default="wavlm_ecapa",
+)
