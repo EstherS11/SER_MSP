@@ -1,0 +1,74 @@
+# ============================================================================
+# 文件3: train_config.yaml - ESP-net训练配置
+# ============================================================================
+
+# ESP-net WavLM + ECAPA-TDNN训练配置
+batch_type: numel
+batch_size: 16
+max_epoch: 50
+patience: 10
+seed: 42
+num_workers: 4
+log_interval_steps: 100
+grad_clip: 5.0
+accum_grad: 1
+
+# 优化器配置
+optim: adamw
+optim_conf:
+  lr: 0.0001
+  weight_decay: 0.001
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# 学习率调度器
+scheduler: cosineannealinglr
+scheduler_conf:
+  T_max: 50
+  eta_min: 1.0e-6
+
+# 模型配置
+model: wavlm_ecapa  # 需要注册的模型名
+model_conf:
+  num_class: 10
+  wavlm_model_name: "microsoft/wavlm-large"
+  wavlm_freeze: true
+  
+  # ECAPA-TDNN配置
+  ecapa_channels: [512, 512, 512]
+  ecapa_kernels: [5, 3, 3]
+  ecapa_dilations: [1, 2, 3]
+  context_dim: 1536
+  embedding_dim: 256
+  
+  # 损失配置
+  loss_type: "focal"  # 或 "focal"
+  focal_gamma: 2.0
+  label_smoothing: 0.1
+  save_macro_f1: true
+
+# 预处理器配置
+preprocessor: default
+preprocessor_conf:
+  # SpecAugment
+  spec_augment: true
+  spec_augment_conf:
+    apply_time_warp: true
+    time_warp_window: 5
+    apply_freq_mask: true
+    freq_mask_width_range: [0, 30]
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range: [0, 40]
+    num_time_mask: 2
+
+# 最佳模型选择（重点关注macro-F1）
+best_model_criterion:
+  - ["valid", "macro_f1", "max"]    # 主要标准
+  - ["valid", "acc", "max"]         # 备选标准
+  - ["valid", "loss", "min"]        # 备选标准
+
+# 其他配置
+resume: true
+keep_nbest_models: 5
+use_tensorboard: true

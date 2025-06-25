@@ -1,0 +1,87 @@
+# config.yaml for ESPnet2 emotion recognition
+
+# Model configuration
+model_conf:
+    num_class: 10
+    wavlm_model: "microsoft/wavlm-large"
+    wavlm_freeze: true
+    hidden_size: 1024
+    ecapa_channels: 512
+    ecapa_kernel_sizes: [5, 3, 3, 3, 1]
+    ecapa_dilations: [1, 2, 3, 4, 1]
+    ecapa_attention_channels: 128
+    ecapa_lin_neurons: 192
+
+# Optimizer
+optim: adam
+optim_conf:
+    lr: 0.001
+    weight_decay: 0.0
+
+# Scheduler
+scheduler: warmuplr
+scheduler_conf:
+    warmup_steps: 1000
+
+# Training configuration
+batch_size: 16
+accum_grad: 1
+grad_clip: 5.0
+num_epochs: 20
+patience: 3
+val_scheduler_criterion:
+    - valid
+    - loss
+
+# Logging
+log_interval: 100
+num_att_plot: 0
+
+# Data configuration
+train_data_path_and_name_and_type:
+    - - "msp_train_10class.json"
+      - "speech"
+      - "sound"
+    - - "msp_train_10class.json"
+      - "emotion"
+      - "text"
+
+valid_data_path_and_name_and_type:
+    - - "msp_valid_10class.json"
+      - "speech"
+      - "sound"
+    - - "msp_valid_10class.json"
+      - "emotion"
+      - "text"
+
+# Preprocessing
+speed_perturb: [0.9, 1.0, 1.1]
+sample_rate: 16000
+
+# Feature extraction
+feats_extract: fbank
+feats_extract_conf:
+    n_fft: 512
+    win_length: 400
+    hop_length: 160
+    fs: 16000
+    fmin: 0
+    fmax: 8000
+    n_mels: 80
+
+# Augmentation
+specaug: specaug
+specaug_conf:
+    apply_time_warp: false
+    time_warp_window: 5
+    time_warp_mode: bicubic
+    apply_freq_mask: true
+    freq_mask_width_range:
+        - 0
+        - 30
+    num_freq_mask: 2
+    apply_time_mask: true
+    time_mask_width_range:
+        - 0
+        - 40
+    num_time_mask: 2
