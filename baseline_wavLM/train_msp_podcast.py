@@ -61,11 +61,11 @@ class HierarchicalWavLMECAPAClassifier(nn.Module):
         # ECAPA-TDNN components (simplified version without MFCC extraction)
         # Based on the ECAPA-TDNN architecture but adapted for feature input
         self.ecapa_encoder = nn.ModuleDict({
-            # SE-Res2Block layers
-            'layer1': SE_Res2Block(wavlm_dim, 512, res2_scale=8, se_channels=128, kernel_size=3),
-            'layer2': SE_Res2Block(512, 512, res2_scale=8, se_channels=128, kernel_size=3),
-            'layer3': SE_Res2Block(512, 512, res2_scale=8, se_channels=128, kernel_size=3),
-            'layer4': nn.Conv1d(512, 1536, kernel_size=1),
+        # SE-Res2Block layers
+        'layer1': SE_Res2Block(wavlm_dim, 512, res2_scale=4, se_channels=128, kernel_size=3),
+        'layer2': SE_Res2Block(512, 512, res2_scale=4, se_channels=128, kernel_size=3),  # 也改成4
+        'layer3': SE_Res2Block(512, 512, res2_scale=4, se_channels=128, kernel_size=3),  # 也改成4
+        'layer4': nn.Conv1d(512, 1536, kernel_size=1),
         })
         
         # Attentive Statistics Pooling
