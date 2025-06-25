@@ -12,15 +12,45 @@ from transformers import WavLMModel
 import warnings
 import time
 import sys
+import argparse
 from datetime import datetime
 from tqdm import tqdm
 import psutil
 import logging
 warnings.filterwarnings('ignore')
 
+# ============= 命令行参数解析 =============
+def parse_args():
+    parser = argparse.ArgumentParser(description='Enhanced MSP Training with Monitoring')
+    
+    # 训练参数
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal loss gamma')
+    parser.add_argument('--num_epochs', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--patience', type=int, default=7, help='Early stopping patience')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of dataloader workers')
+    parser.add_argument('--save_dir', type=str, default='experiments', help='Directory to save results')
+    
+    # 模型参数
+    parser.add_argument('--wavlm_name', type=str, default='microsoft/wavlm-large', 
+                       help='WavLM model name')
+    parser.add_argument('--freeze_wavlm', action='store_true', default=True,
+                       help='Freeze WavLM parameters')
+    
+    # 数据参数
+    parser.add_argument('--sample_rate', type=int, default=16000, help='Audio sample rate')
+    parser.add_argument('--augment_prob', type=float, default=0.8, help='Augmentation probability')
+    
+    return parser.parse_args()
+
 # ============= 设置详细日志 =============
-def setup_logging(log_file):
+def setup_logging(save_dir):
     """设置详细的日志记录"""
+    os.makedirs(save_dir, exist_ok=True)
+    log_file = os.path.join(save_dir, f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -40,6 +70,7 @@ def get_system_info():
     if torch.cuda.is_available():
         gpu_memory_used = torch.cuda.memory_allocated() / 1024**3
         gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        gpu_utilization = 0  # 简化版本，可以用nvidia-ml-py获取更详细信息
         gpu_info = f"GPU Memory: {gpu_memory_used:.1f}/{gpu_memory_total:.1f}GB"
     
     return f"CPU: {cpu_percent}% | RAM: {memory.percent}% | {gpu_info}"
@@ -320,7 +351,7 @@ class AudioAugmentationPipeline:
 # ============= Efficient Dataset with Dynamic Padding =============
 class EfficientMSPDataset(Dataset):
     """Dataset with efficient loading and augmentation"""
-    def __init__(self, json_path, root_dir, augment=False, sample_rate=16000):
+    def __init__(self, json_path, root_dir, augment=False, sample_rate=16000, augment_prob=0.8):
         with open(json_path, 'r') as f:
             self.data = json.load(f)
         
@@ -331,6 +362,7 @@ class EfficientMSPDataset(Dataset):
         
         if augment:
             self.augmentation_pipeline = AudioAugmentationPipeline(sample_rate)
+            self.augment_prob = augment_prob
             
         self.emotion_map = {
             'N': 0, 'H': 1, 'S': 2, 'A': 3, 'F': 4,
@@ -361,7 +393,7 @@ class EfficientMSPDataset(Dataset):
         
         # Apply augmentation
         if self.augment:
-            waveform = self.augmentation_pipeline(waveform)
+            waveform = self.augmentation_pipeline(waveform, augmentation_prob=self.augment_prob)
         
         # Get label
         label = self.emotion_map[item['emo']]
@@ -389,12 +421,19 @@ def collate_fn_padd(batch):
 
 # ============= Training Script with Enhanced Monitoring =============
 def train_improved_model():
+    # 解析命令行参数
+    args = parse_args()
+    
     # 设置详细日志
-    log_file = f"logs/detailed_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    logger = setup_logging(log_file)
+    logger = setup_logging(args.save_dir)
     
     logger.info("🚀 Starting training with enhanced monitoring...")
     logger.info(f"🕐 Training started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # 打印所有参数
+    logger.info("📋 Training Configuration:")
+    for arg, value in vars(args).items():
+        logger.info(f"  {arg}: {value}")
     
     # Configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -403,10 +442,6 @@ def train_improved_model():
     if torch.cuda.is_available():
         logger.info(f"🔧 GPU: {torch.cuda.get_device_name(0)}")
         logger.info(f"🔧 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
-    
-    batch_size = 16  # 减小batch size以获得更频繁的更新
-    learning_rate = 1e-4
-    num_epochs = 50
     
     # Data paths
     if os.path.exists('/data/user_data/esthers/SER_MSP'):
@@ -421,37 +456,40 @@ def train_improved_model():
     train_dataset = EfficientMSPDataset(
         os.path.join(root_dir, 'msp_train_10class.json'),
         root_dir,
-        augment=True
+        augment=True,
+        sample_rate=args.sample_rate,
+        augment_prob=args.augment_prob
     )
     
     logger.info("🔄 Loading validation dataset...")
     valid_dataset = EfficientMSPDataset(
         os.path.join(root_dir, 'msp_valid_10class.json'),
         root_dir,
-        augment=False
+        augment=False,
+        sample_rate=args.sample_rate
     )
     
     logger.info(f"📊 Training samples: {len(train_dataset):,}")
     logger.info(f"📊 Validation samples: {len(valid_dataset):,}")
-    logger.info(f"📊 Batches per epoch: {len(train_dataset) // batch_size:,}")
+    logger.info(f"📊 Batches per epoch: {len(train_dataset) // args.batch_size:,}")
     
     # Create dataloaders with custom collate function
     logger.info("🔄 Creating data loaders...")
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_fn_padd,
-        num_workers=4,  # 可以根据需要调整
+        num_workers=args.num_workers,
         pin_memory=True
     )
     
     valid_loader = DataLoader(
         valid_dataset,
-        batch_size=batch_size,
+        batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_fn_padd,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True
     )
     
@@ -460,7 +498,11 @@ def train_improved_model():
     # Initialize model
     logger.info("🔄 Initializing HierarchicalWavLMECAPAClassifier...")
     model_start_time = time.time()
-    model = HierarchicalWavLMECAPAClassifier(num_classes=10).to(device)
+    model = HierarchicalWavLMECAPAClassifier(
+        num_classes=10, 
+        wavlm_name=args.wavlm_name, 
+        freeze_wavlm=args.freeze_wavlm
+    ).to(device)
     model_init_time = time.time() - model_start_time
     logger.info(f"✅ Model initialized in {model_init_time:.2f} seconds")
     
@@ -470,6 +512,11 @@ def train_improved_model():
     logger.info(f"📊 Total parameters: {total_params:,}")
     logger.info(f"📊 Trainable parameters: {trainable_params:,}")
     logger.info(f"📊 Frozen parameters: {total_params - trainable_params:,}")
+    
+    # 添加GPU使用验证
+    logger.info("🔍 Verifying GPU usage...")
+    logger.info(f"  Model device: {next(model.parameters()).device}")
+    logger.info(f"  WavLM device: {next(model.wavlm.parameters()).device}")
     
     # Calculate class weights for focal loss
     logger.info("🔄 Calculating class weights...")
@@ -490,26 +537,27 @@ def train_improved_model():
         logger.info(f"  {name}: {count:,} samples (weight: {class_weights[i]:.3f})")
     
     # Loss and optimizer
-    criterion = FocalLoss(alpha=class_weights, gamma=2.0)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
+    criterion = FocalLoss(alpha=class_weights, gamma=args.focal_gamma)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=learning_rate,
-        epochs=num_epochs,
+        max_lr=args.learning_rate,
+        epochs=args.num_epochs,
         steps_per_epoch=len(train_loader),
         pct_start=0.1
     )
     
-    logger.info(f"🎯 Starting training for {num_epochs} epochs...")
+    logger.info(f"🎯 Starting training for {args.num_epochs} epochs...")
     logger.info("=" * 80)
     
     # Training loop
     best_valid_f1 = 0
     total_training_time = 0
+    patience_counter = 0
     
-    for epoch in range(num_epochs):
+    for epoch in range(args.num_epochs):
         epoch_start_time = time.time()
-        logger.info(f"🔄 Epoch {epoch+1}/{num_epochs} started")
+        logger.info(f"🔄 Epoch {epoch+1}/{args.num_epochs} started")
         logger.info(f"📊 {get_system_info()}")
         
         # Train
@@ -529,10 +577,21 @@ def train_improved_model():
             waveforms = waveforms.to(device)
             labels = labels.to(device)
             
+            # 在第一个batch验证GPU使用
+            if epoch == 0 and batch_idx == 0:
+                logger.info(f"🔍 First batch GPU verification:")
+                logger.info(f"  Waveforms device: {waveforms.device}")
+                logger.info(f"  Labels device: {labels.device}")
+                logger.info(f"  GPU memory before forward: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+            
             optimizer.zero_grad()
             outputs = model(waveforms)
             loss = criterion(outputs, labels)
             loss.backward()
+            
+            # 在第一个batch验证GPU使用
+            if epoch == 0 and batch_idx == 0:
+                logger.info(f"  GPU memory after forward: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
             
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -606,7 +665,7 @@ def train_improved_model():
         total_training_time += epoch_time
         
         # 详细的epoch总结
-        logger.info(f"\n🎯 Epoch {epoch+1}/{num_epochs} Results:")
+        logger.info(f"\n🎯 Epoch {epoch+1}/{args.num_epochs} Results:")
         logger.info(f"  ⏱️ Epoch time: {epoch_time/60:.2f} minutes")
         logger.info(f"  📊 Train Loss: {train_loss/len(train_loader):.4f} | Train F1: {train_f1:.4f}")
         logger.info(f"  📊 Valid Loss: {valid_loss/len(valid_loader):.4f} | Valid F1: {valid_f1:.4f}")
@@ -617,6 +676,7 @@ def train_improved_model():
         # Save best model
         if valid_f1 > best_valid_f1:
             best_valid_f1 = valid_f1
+            patience_counter = 0
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -627,9 +687,19 @@ def train_improved_model():
                 'train_f1': train_f1,
                 'valid_f1': valid_f1,
                 'total_training_time': total_training_time,
+                'args': args,
             }
-            torch.save(checkpoint, 'hierarchical_best_model.pth')
-            logger.info(f"  ✅ Saved best model with Valid F1: {best_valid_f1:.4f}")
+            best_model_path = os.path.join(args.save_dir, 'best_model.pth')
+            torch.save(checkpoint, best_model_path)
+            logger.info(f"  ✅ Saved best model to {best_model_path} with Valid F1: {best_valid_f1:.4f}")
+        else:
+            patience_counter += 1
+            logger.info(f"  ⏳ No improvement. Patience: {patience_counter}/{args.patience}")
+        
+        # Early stopping
+        if patience_counter >= args.patience:
+            logger.info(f"🛑 Early stopping triggered after {epoch+1} epochs")
+            break
         
         logger.info("-" * 80)
     
