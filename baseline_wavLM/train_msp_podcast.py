@@ -11,6 +11,7 @@ from sklearn.metrics import f1_score, classification_report
 from transformers import WavLMModel
 import warnings
 warnings.filterwarnings('ignore')
+
 # ============= Focal Loss Implementation =============
 class FocalLoss(nn.Module):
     """Focal Loss for addressing class imbalance"""
@@ -38,78 +39,7 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
 
-
-
-# ============= 1. Hierarchical Model Architecture =============
-class HierarchicalWavLMECAPAClassifier(nn.Module):
-    """
-    Serial/Hierarchical Architecture: WavLM -> ECAPA-TDNN -> Classifier
-    WavLM extracts frame-level features, ECAPA performs intelligent pooling
-    """
-    def __init__(self, num_classes=10, wavlm_name="microsoft/wavlm-large", freeze_wavlm=True):
-        super(HierarchicalWavLMECAPAClassifier, self).__init__()
-        
-        # WavLM as feature extractor
-        self.wavlm = WavLMModel.from_pretrained(wavlm_name)
-        if freeze_wavlm:
-            for param in self.wavlm.parameters():
-                param.requires_grad = False
-        
-        # Get WavLM output dimension
-        wavlm_dim = 1024  # WavLM-large output dimension
-        
-        # ECAPA-TDNN components (simplified version without MFCC extraction)
-        # Based on the ECAPA-TDNN architecture but adapted for feature input
-        self.ecapa_encoder = nn.ModuleDict({
-        # SE-Res2Block layers
-        'layer1': SE_Res2Block(wavlm_dim, 512, res2_scale=4, se_channels=128, kernel_size=3),
-        'layer2': SE_Res2Block(512, 512, res2_scale=4, se_channels=128, kernel_size=3),  # 也改成4
-        'layer3': SE_Res2Block(512, 512, res2_scale=4, se_channels=128, kernel_size=3),  # 也改成4
-        'layer4': nn.Conv1d(512, 1536, kernel_size=1),
-        })
-        
-        # Attentive Statistics Pooling
-        self.asp = AttentiveStatisticsPooling(1536, attention_channels=128)
-        
-        # Final embedding layer
-        self.fc_emb = nn.Linear(3072, 192)  # 1536*2 from ASP
-        self.bn_emb = nn.BatchNorm1d(192)
-        
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Linear(192, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
-        )
-        
-    def forward(self, waveform):
-        # 1. WavLM feature extraction
-        # Output: [Batch, Time, 1024]
-        wavlm_features = self.wavlm(waveform).last_hidden_state
-        
-        # 2. Transpose for CNN processing: [Batch, 1024, Time]
-        features = wavlm_features.transpose(1, 2)
-        
-        # 3. ECAPA encoding
-        x = self.ecapa_encoder['layer1'](features)
-        x = self.ecapa_encoder['layer2'](x)
-        x = self.ecapa_encoder['layer3'](x)
-        x = self.ecapa_encoder['layer4'](x)
-        
-        # 4. Attentive Statistics Pooling
-        pooled = self.asp(x)
-        
-        # 5. Final embedding
-        emb = self.fc_emb(pooled)
-        emb = self.bn_emb(emb)
-        
-        # 6. Classification
-        logits = self.classifier(emb)
-        
-        return logits
-
-# ECAPA-TDNN Components
+# ECAPA-TDNN Components - 保持原始实现
 class SE_Res2Block(nn.Module):
     """Squeeze-Excitation Res2Block used in ECAPA-TDNN"""
     def __init__(self, in_channels, out_channels, res2_scale=8, se_channels=128, kernel_size=3):
@@ -197,6 +127,87 @@ class AttentiveStatisticsPooling(nn.Module):
         pooled = torch.cat([mu, rh], dim=1)
         
         return pooled
+
+# ============= 1. Hierarchical Model Architecture - 使用你的方案 =============
+class HierarchicalWavLMECAPAClassifier(nn.Module):
+    """
+    Serial/Hierarchical Architecture: WavLM -> ECAPA-TDNN -> Classifier
+    WavLM extracts frame-level features, ECAPA performs intelligent pooling
+    """
+    def __init__(self, num_classes=10, wavlm_name="microsoft/wavlm-large", freeze_wavlm=True):
+        super(HierarchicalWavLMECAPAClassifier, self).__init__()
+        
+        # WavLM as feature extractor
+        self.wavlm = WavLMModel.from_pretrained(wavlm_name)
+        if freeze_wavlm:
+            for param in self.wavlm.parameters():
+                param.requires_grad = False
+        
+        # Get WavLM output dimension
+        wavlm_dim = 1024  # WavLM-large output dimension
+        ecapa_dim = 512   # The internal dimension for ECAPA blocks
+        
+        # 新增: 输入投影层，将WavLM的1024维映射到ECAPA的512维
+        self.input_projection = nn.Sequential(
+            nn.Conv1d(wavlm_dim, ecapa_dim, kernel_size=1),
+            nn.BatchNorm1d(ecapa_dim),
+            nn.ReLU()
+        )
+        
+        # ECAPA-TDNN components (simplified version without MFCC extraction)
+        # Based on the ECAPA-TDNN architecture but adapted for feature input
+        self.ecapa_encoder = nn.ModuleDict({
+            # 修改: layer1的输入通道现在是ecapa_dim (512)
+            'layer1': SE_Res2Block(ecapa_dim, ecapa_dim, res2_scale=4, se_channels=128, kernel_size=3),
+            'layer2': SE_Res2Block(ecapa_dim, ecapa_dim, res2_scale=4, se_channels=128, kernel_size=3),
+            'layer3': SE_Res2Block(ecapa_dim, ecapa_dim, res2_scale=4, se_channels=128, kernel_size=3),
+            'layer4': nn.Conv1d(ecapa_dim, 1536, kernel_size=1), # 从512扩展到1536
+        })
+        
+        # Attentive Statistics Pooling
+        self.asp = AttentiveStatisticsPooling(1536, attention_channels=128)
+        
+        # Final embedding layer
+        self.fc_emb = nn.Linear(3072, 192)  # 1536*2 from ASP
+        self.bn_emb = nn.BatchNorm1d(192)
+        
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(192, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
+        
+    def forward(self, waveform):
+        # 1. WavLM feature extraction
+        # Output: [Batch, Time, 1024]
+        wavlm_features = self.wavlm(waveform).last_hidden_state
+        
+        # 2. Transpose for CNN processing: [Batch, 1024, Time]
+        features = wavlm_features.transpose(1, 2)
+        
+        # 新增: 应用输入投影层
+        projected_features = self.input_projection(features)
+        
+        # 3. ECAPA encoding (从投影后的特征开始)
+        # 修改: 将projected_features送入layer1
+        x = self.ecapa_encoder['layer1'](projected_features)
+        x = self.ecapa_encoder['layer2'](x)
+        x = self.ecapa_encoder['layer3'](x)
+        x = self.ecapa_encoder['layer4'](x)
+        
+        # 4. Attentive Statistics Pooling
+        pooled = self.asp(x)
+        
+        # 5. Final embedding
+        emb = self.fc_emb(pooled)
+        emb = self.bn_emb(emb)
+        
+        # 6. Classification
+        logits = self.classifier(emb)
+        
+        return logits
 
 # ============= 2. Enhanced Data Augmentation =============
 class AudioAugmentationPipeline:
@@ -350,8 +361,12 @@ def collate_fn_padd(batch):
 
 # ============= Training Script =============
 def train_improved_model():
+    print("Starting training with improved hierarchical architecture...")
+    
     # Configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
     batch_size = 16
     learning_rate = 1e-4
     num_epochs = 50
@@ -361,6 +376,8 @@ def train_improved_model():
         root_dir = '/data/user_data/esthers/SER_MSP'
     else:
         root_dir = '/Users/esthersun/Desktop/SER/SER_MSP'
+    
+    print(f"Data directory: {root_dir}")
     
     # Create datasets with efficient loading
     train_dataset = EfficientMSPDataset(
@@ -374,6 +391,9 @@ def train_improved_model():
         root_dir,
         augment=False
     )
+    
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(valid_dataset)}")
     
     # Create dataloaders with custom collate function
     train_loader = DataLoader(
@@ -395,7 +415,14 @@ def train_improved_model():
     )
     
     # Initialize model
+    print("Initializing HierarchicalWavLMECAPAClassifier...")
     model = HierarchicalWavLMECAPAClassifier(num_classes=10).to(device)
+    
+    # Print model architecture
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
     
     # Calculate class weights for focal loss
     emotion_counts = {}
@@ -409,10 +436,14 @@ def train_improved_model():
         for i in range(10)
     ]).to(device)
     
+    print("Class distribution:")
+    emotion_names = ['N', 'H', 'S', 'A', 'F', 'D', 'U', 'C', 'O', 'X']
+    for i, (name, count) in enumerate(zip(emotion_names, [emotion_counts.get(i, 0) for i in range(10)])):
+        print(f"  {name}: {count} samples (weight: {class_weights[i]:.3f})")
+    
     # Loss and optimizer
-
     criterion = FocalLoss(alpha=class_weights, gamma=2.0)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=learning_rate,
@@ -420,6 +451,9 @@ def train_improved_model():
         steps_per_epoch=len(train_loader),
         pct_start=0.1
     )
+    
+    print(f"Starting training for {num_epochs} epochs...")
+    print("=" * 60)
     
     # Training loop
     best_valid_f1 = 0
@@ -430,7 +464,7 @@ def train_improved_model():
         train_preds = []
         train_labels = []
         
-        for waveforms, labels, lengths in train_loader:
+        for batch_idx, (waveforms, labels, lengths) in enumerate(train_loader):
             waveforms = waveforms.to(device)
             labels = labels.to(device)
             
@@ -449,6 +483,10 @@ def train_improved_model():
             preds = torch.argmax(outputs, dim=1)
             train_preds.extend(preds.cpu().numpy())
             train_labels.extend(labels.cpu().numpy())
+            
+            # Print progress every 50 batches
+            if (batch_idx + 1) % 50 == 0:
+                print(f"Epoch {epoch+1}/{num_epochs}, Batch {batch_idx+1}/{len(train_loader)}, Loss: {loss.item():.4f}")
         
         # Validation
         model.eval()
@@ -473,9 +511,10 @@ def train_improved_model():
         train_f1 = f1_score(train_labels, train_preds, average='macro')
         valid_f1 = f1_score(valid_labels, valid_preds, average='macro')
         
-        print(f"Epoch {epoch+1}/{num_epochs}")
+        print(f"\nEpoch {epoch+1}/{num_epochs} Results:")
         print(f"Train Loss: {train_loss/len(train_loader):.4f}, Train F1: {train_f1:.4f}")
         print(f"Valid Loss: {valid_loss/len(valid_loader):.4f}, Valid F1: {valid_f1:.4f}")
+        print(f"Learning Rate: {scheduler.get_last_lr()[0]:.6f}")
         
         # Save best model
         if valid_f1 > best_valid_f1:
@@ -484,9 +523,36 @@ def train_improved_model():
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'best_valid_f1': best_valid_f1,
+                'class_weights': class_weights,
             }, 'hierarchical_best_model.pth')
-            print(f"Saved best model with Valid F1: {best_valid_f1:.4f}")
+            print(f"✓ Saved best model with Valid F1: {best_valid_f1:.4f}")
+        
+        print("-" * 60)
+    
+    print("Training completed!")
+    print(f"Best validation F1 score: {best_valid_f1:.4f}")
+    
+    # Final evaluation with detailed classification report
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for waveforms, labels, lengths in valid_loader:
+            waveforms = waveforms.to(device)
+            labels = labels.to(device)
+            
+            outputs = model(waveforms)
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    print("\nFinal Classification Report:")
+    print(classification_report(all_labels, all_preds, 
+                              target_names=emotion_names, 
+                              digits=4))
 
 if __name__ == "__main__":
     train_improved_model()
