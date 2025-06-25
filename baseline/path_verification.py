@@ -52,10 +52,20 @@ def verify_data_structure():
                 first_sample = data[first_key]
                 audio_path = first_sample['wav']
                 
-                if os.path.exists(audio_path):
-                    print(f"   ✅ Audio path accessible: {audio_path}")
+                # 处理相对路径
+                if not audio_path.startswith('/'):
+                    # 相对路径，转换为绝对路径
+                    if audio_path.startswith('DATA/'):
+                        full_audio_path = os.path.join(DATA_ROOT, audio_path)
+                    else:
+                        full_audio_path = os.path.join(DATA_ROOT, "DATA", "Audios", os.path.basename(audio_path))
                 else:
-                    print(f"   ❌ Audio path missing: {audio_path}")
+                    full_audio_path = audio_path
+                
+                if os.path.exists(full_audio_path):
+                    print(f"   ✅ Audio path accessible: {audio_path} -> {full_audio_path}")
+                else:
+                    print(f"   ❌ Audio path missing: {audio_path} -> {full_audio_path}")
                     
                 print(f"   🎭 Emotion: {first_sample['emo']}")
                 
@@ -123,12 +133,21 @@ def test_json_audio_mapping():
         wav_path = info['wav']
         emotion = info['emo']
         
-        if os.path.exists(wav_path):
+        # 处理相对路径
+        if not wav_path.startswith('/'):
+            if wav_path.startswith('DATA/'):
+                full_wav_path = os.path.join(DATA_ROOT, wav_path)
+            else:
+                full_wav_path = os.path.join(DATA_ROOT, "DATA", "Audios", os.path.basename(wav_path))
+        else:
+            full_wav_path = wav_path
+        
+        if os.path.exists(full_wav_path):
             accessible_count += 1
-            print(f"✅ {utt_id}: {emotion} -> {wav_path}")
+            print(f"✅ {utt_id}: {emotion} -> {wav_path} (found at: {full_wav_path})")
         else:
             missing_count += 1
-            print(f"❌ {utt_id}: {emotion} -> {wav_path} (MISSING)")
+            print(f"❌ {utt_id}: {emotion} -> {wav_path} (looked at: {full_wav_path})")
     
     print(f"\n📈 Sample test results:")
     print(f"   ✅ Accessible: {accessible_count}/10")
@@ -160,6 +179,56 @@ def check_current_working_directory():
         print(f"Run: cd {expected_baseline}")
         return False
 
+def fix_json_paths_inplace():
+    """在验证时直接修复JSON路径问题"""
+    
+    print(f"\n🔧 Fixing JSON paths in place...")
+    
+    DATA_ROOT = "/data/user_data/esthers/SER_MSP"
+    json_files = [
+        "msp_train_10class.json",
+        "msp_valid_10class.json", 
+        "msp_test_10class.json"
+    ]
+    
+    for json_file in json_files:
+        json_path = Path(DATA_ROOT) / json_file
+        
+        if not json_path.exists():
+            continue
+        
+        print(f"📄 Fixing paths in {json_file}...")
+        
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        
+        fixed_count = 0
+        for utt_id, info in data.items():
+            old_path = info['wav']
+            
+            # 如果已经是绝对路径，跳过
+            if old_path.startswith('/'):
+                continue
+            
+            # 转换为绝对路径
+            if old_path.startswith('DATA/'):
+                new_path = os.path.join(DATA_ROOT, old_path)
+            else:
+                new_path = os.path.join(DATA_ROOT, "DATA", "Audios", os.path.basename(old_path))
+            
+            # 只有文件存在时才更新路径
+            if os.path.exists(new_path):
+                info['wav'] = new_path
+                fixed_count += 1
+        
+        if fixed_count > 0:
+            # 保存修复后的文件
+            with open(json_path, 'w') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"✅ Fixed {fixed_count} paths in {json_file}")
+        else:
+            print(f"⚠️  No paths fixed in {json_file}")
+
 def main():
     print("🔍 SER_MSP Data Structure Verification")
     print("=" * 50)
@@ -168,17 +237,26 @@ def main():
     verify_data_structure()
     
     # 2. 测试JSON-音频映射
-    test_json_audio_mapping()
+    mapping_ok = test_json_audio_mapping()
     
-    # 3. 检查工作目录
+    # 3. 如果映射有问题，尝试修复
+    if not mapping_ok:
+        fix_json_paths_inplace()
+        print(f"\n🔄 Re-testing after path fixing...")
+        mapping_ok = test_json_audio_mapping()
+    
+    # 4. 检查工作目录
     check_current_working_directory()
     
     print("\n" + "=" * 50)
     print("🎯 Summary:")
-    print("If all checks pass, you can run:")
-    print("  cd /data/user_data/esthers/SER_MSP/baseline")
-    print("  python register_model.py")
-    print("  python minimal_test.py")
+    if mapping_ok:
+        print("✅ All paths verified! You can run:")
+        print("  cd /data/user_data/esthers/SER_MSP/baseline")
+        print("  python register_model.py")
+        print("  python minimal_test.py")
+    else:
+        print("❌ Path issues remain. Please check your DATA directory.")
     print("=" * 50)
 
 if __name__ == "__main__":
