@@ -317,7 +317,7 @@ def main():
     create_ser_inference_script()
     
     # 4. 创建配置文件
-    print("\n⚙️  Step 4: Creating configuration file...")
+    print("\n⚙️ ss Step 4: Creating configuration file...")
     create_train_config()
     
     print("\n" + "=" * 60)
