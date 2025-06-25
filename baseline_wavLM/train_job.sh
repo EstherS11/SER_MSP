@@ -67,7 +67,7 @@ echo "========================================="
 
 # Run the training script
 python baseline_wavLM/train_msp_podcast.py \
-    --batch_size 48 \
+    --batch_size 24 \
     --learning_rate 1e-4 \
     --weight_decay 1e-4 \
     --focal_gamma 2.0 \
