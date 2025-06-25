@@ -90,11 +90,21 @@ def main():
     # 运行SER训练 - 修复调用方式
     try:
         from espnet2.bin.launch import launch
+        
+        def train_func(args):
+            return SERTask.main(
+                cmd=None,
+                parser=parser,
+                args=args,
+                task_class=SERTask,
+            )
+        
         launch(
-            main_func=SERTask.main,
+            main_func=train_func,
             parser=parser,
             args=args,
         )
+        
     except ImportError:
         # 如果launch不可用，使用直接调用
         try:

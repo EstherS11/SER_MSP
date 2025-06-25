@@ -14,7 +14,9 @@ import numpy as np
 from espnet2.train.abs_espnet_model import AbsESPnetModel
 from espnet2.tasks.abs_task import AbsTask
 from espnet2.train.class_choices import ClassChoices
-from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
+# 需要额外导入
+from espnet2.train.preprocessor import CommonPreprocessor
+from espnet2.train.trainer import Trainer
 
 class SERes2NetBlock(nn.Module):
     """ECAPA-TDNN的SE-Res2Net块"""
@@ -150,15 +152,15 @@ class WavLMECAPAModel(AbsESPnetModel):
     def __init__(
         self,
         num_class: int,
-        wavlm_model_name: str = "microsoft/wavlm-large",
+        wavlm_model_name: str = "microsoft/wavlm-base",  # 改为base版本
         wavlm_freeze: bool = True,
         
         # ECAPA-TDNN配置
         ecapa_channels: List[int] = None,
         ecapa_kernels: List[int] = None,
         ecapa_dilations: List[int] = None,
-        context_dim: int = 1536,
-        embedding_dim: int = 256,
+        context_dim: int = 512,  # 减小参数
+        embedding_dim: int = 128,  # 减小参数
         
         # 损失和优化配置
         loss_type: str = "cross_entropy",
@@ -171,13 +173,13 @@ class WavLMECAPAModel(AbsESPnetModel):
     ):
         super().__init__()
         
-        # 默认值
+        # 默认值 - 适用于快速测试
         if ecapa_channels is None:
-            ecapa_channels = [512, 512, 512]
+            ecapa_channels = [256, 256]  # 减少层数
         if ecapa_kernels is None:
-            ecapa_kernels = [5, 3, 3]
+            ecapa_kernels = [3, 3]
         if ecapa_dilations is None:
-            ecapa_dilations = [1, 2, 3]
+            ecapa_dilations = [1, 2]
         
         self.num_class = num_class
         self.save_macro_f1 = save_macro_f1
@@ -390,52 +392,82 @@ class WavLMECAPAModel(AbsESPnetModel):
 
 
 # ============================================================================
-# SER任务类 - ESP-net集成
+# 完全修复的SER任务类 - ESP-net集成
 # ============================================================================
 
 class SERTask(AbsTask):
-    """Speech Emotion Recognition Task for ESP-net"""
+    """完全兼容ESP-net的语音情感识别任务"""
     
+    # ESP-net任务必需属性
     num_optimizers: int = 1
+    trainer = Trainer
+    class_choices_list = [
+        ClassChoices(
+            name="model",
+            classes=dict(wavlm_ecapa=WavLMECAPAModel),
+            type_check=AbsESPnetModel,
+            default="wavlm_ecapa",
+        ),
+        ClassChoices(
+            name="preprocessor", 
+            classes=dict(default=CommonPreprocessor),
+            type_check=CommonPreprocessor,
+            default="default",
+        ),
+    ]
     
     @classmethod
     def add_task_arguments(cls, parser):
         """添加SER任务特定参数"""
         group = parser.add_argument_group("SER task related")
-        group.add_argument("--num_class", type=int, default=10, help="Number of emotion classes")
         
         # 模型参数
-        group.add_argument("--wavlm_model_name", type=str, default="microsoft/wavlm-large")
+        group.add_argument("--num_class", type=int, default=10, help="Number of emotion classes")
+        group.add_argument("--wavlm_model_name", type=str, default="microsoft/wavlm-base")
         group.add_argument("--wavlm_freeze", type=bool, default=True)
-        group.add_argument("--ecapa_channels", type=int, nargs="+", default=[512, 512, 512])
-        group.add_argument("--ecapa_kernels", type=int, nargs="+", default=[5, 3, 3])
-        group.add_argument("--ecapa_dilations", type=int, nargs="+", default=[1, 2, 3])
-        group.add_argument("--context_dim", type=int, default=1536)
-        group.add_argument("--embedding_dim", type=int, default=256)
+        group.add_argument("--ecapa_channels", type=int, nargs="+", default=[256, 256])
+        group.add_argument("--ecapa_kernels", type=int, nargs="+", default=[3, 3])
+        group.add_argument("--ecapa_dilations", type=int, nargs="+", default=[1, 2])
+        group.add_argument("--context_dim", type=int, default=512)
+        group.add_argument("--embedding_dim", type=int, default=128)
         group.add_argument("--loss_type", type=str, default="cross_entropy")
         group.add_argument("--focal_gamma", type=float, default=2.0)
         group.add_argument("--label_smoothing", type=float, default=0.0)
         group.add_argument("--save_macro_f1", type=bool, default=True)
         
+        # ESP-net标准参数
+        group.add_argument("--model", type=str, default="wavlm_ecapa", help="Model type")
+        group.add_argument("--preprocessor", type=str, default="default", help="Preprocessor type")
+    
+    @classmethod
+    def build_collate_fn(cls, args, train: bool):
+        """构建数据整理函数"""
+        return CommonCollateFn(float_pad_value=0.0, int_pad_value=-1)
+    
+    @classmethod
+    def build_preprocess_fn(cls, args, train: bool):
+        """构建预处理函数"""
+        if hasattr(args, 'preprocessor_conf'):
+            preprocessor = cls.class_choices_list[1].get_class(args.preprocessor)
+            return preprocessor(**args.preprocessor_conf)
+        return None
+    
     @classmethod
     def build_model(cls, args):
         """构建模型"""
-        model_conf = getattr(args, 'model_conf', {})
-        
         return WavLMECAPAModel(
             num_class=getattr(args, 'num_class', 10),
-            wavlm_model_name=getattr(args, 'wavlm_model_name', "microsoft/wavlm-large"),
+            wavlm_model_name=getattr(args, 'wavlm_model_name', "microsoft/wavlm-base"),
             wavlm_freeze=getattr(args, 'wavlm_freeze', True),
-            ecapa_channels=getattr(args, 'ecapa_channels', [512, 512, 512]),
-            ecapa_kernels=getattr(args, 'ecapa_kernels', [5, 3, 3]),
-            ecapa_dilations=getattr(args, 'ecapa_dilations', [1, 2, 3]),
-            context_dim=getattr(args, 'context_dim', 1536),
-            embedding_dim=getattr(args, 'embedding_dim', 256),
+            ecapa_channels=getattr(args, 'ecapa_channels', [256, 256]),
+            ecapa_kernels=getattr(args, 'ecapa_kernels', [3, 3]),
+            ecapa_dilations=getattr(args, 'ecapa_dilations', [1, 2]),
+            context_dim=getattr(args, 'context_dim', 512),
+            embedding_dim=getattr(args, 'embedding_dim', 128),
             loss_type=getattr(args, 'loss_type', "cross_entropy"),
             focal_gamma=getattr(args, 'focal_gamma', 2.0),
             label_smoothing=getattr(args, 'label_smoothing', 0.0),
             save_macro_f1=getattr(args, 'save_macro_f1', True),
-            **model_conf
         )
     
     @classmethod
