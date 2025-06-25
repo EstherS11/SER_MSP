@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# fixed_cloud_run.py - 修复版云端集群运行脚本
+# completely_fixed_cloud_run.py - 完全修复版云端运行脚本
 
 import sys
 import os
@@ -8,22 +8,23 @@ import subprocess
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 import numpy as np
 from pathlib import Path
 from collections import Counter
-import logging
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import f1_score, classification_report
 from tqdm import tqdm
+import logging
 
 # ============================================================================
-# 云端集群配置 - 根据你的实际路径
+# 云端集群配置
 # ============================================================================
 
-# 🔧 你的实际数据路径
 DATA_ROOT = "/data/user_data/esthers/SER_MSP"
 BASELINE_DIR = "/data/user_data/esthers/SER_MSP/baseline"
 AUDIO_DIR = "/data/user_data/esthers/SER_MSP/DATA/Audios"
 
-# JSON文件路径
 JSON_FILES = {
     'train': f"{DATA_ROOT}/msp_train_10class.json",
     'valid': f"{DATA_ROOT}/msp_valid_10class.json", 
@@ -31,35 +32,44 @@ JSON_FILES = {
 }
 
 # ============================================================================
-# 修复：直接使用ASR任务进行SER（ESP-net推荐方式）
+# 修复1：解决音频文件路径问题
 # ============================================================================
 
-def create_fixed_data_prep():
-    """创建修复版数据准备脚本 - 使用ASR多任务格式"""
+def fix_audio_paths(json_file, audio_dir):
+    """修复JSON文件中的音频路径"""
+    print(f"🔧 Fixing audio paths in {json_file}...")
     
-    data_prep_code = '''#!/usr/bin/env python3
-# fixed_cloud_data_prep.py - 修复版云端数据准备脚本
+    with open(json_file, 'r') as f:
+        data = json.load(f)
+    
+    audio_path = Path(audio_dir)
+    fixed_count = 0
+    missing_count = 0
+    
+    for utt_id, info in data.items():
+        original_path = info['wav']
+        
+        # 如果原路径不存在，尝试在AUDIO_DIR中查找
+        if not os.path.exists(original_path):
+            # 从原路径提取文件名
+            filename = os.path.basename(original_path)
+            new_path = audio_path / filename
+            
+            if new_path.exists():
+                info['wav'] = str(new_path)
+                fixed_count += 1
+            else:
+                missing_count += 1
+        else:
+            fixed_count += 1
+    
+    print(f"✅ Fixed {fixed_count} paths, {missing_count} still missing")
+    return data, fixed_count, missing_count
 
-import json
-import os
-import numpy as np
-from pathlib import Path
-from collections import Counter
-
-def prepare_asr_multitask_data(output_dir="data"):
-    """
-    准备ASR多任务格式数据 - ESP-net推荐的SER实现方式
-    同时预测文本转录和情感标签
-    """
+def prepare_fixed_data(output_dir="data"):
+    """准备修复后的数据"""
+    print("🔧 Preparing data with fixed paths...")
     
-    # 云端路径配置
-    JSON_FILES = {
-        'train': "/data/user_data/esthers/SER_MSP/msp_train_10class.json",
-        'valid': "/data/user_data/esthers/SER_MSP/msp_valid_10class.json", 
-        'test': "/data/user_data/esthers/SER_MSP/msp_test_10class.json"
-    }
-    
-    # MSP-PODCAST情感标签映射
     emotion_map = {
         'N': 0, 'H': 1, 'S': 2, 'A': 3, 'F': 4,
         'D': 5, 'U': 6, 'C': 7, 'O': 8, 'X': 9
@@ -73,173 +83,130 @@ def prepare_asr_multitask_data(output_dir="data"):
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
     
-    print("🔧 Preparing ASR multi-task format data for SER...")
+    total_stats = {}
     
-    stats = {}
-    
-    # 处理每个数据集
     for split, json_file in JSON_FILES.items():
-        print(f"\\nProcessing {split} set...")
+        print(f"\n🔧 Processing {split} set...")
         
         if not Path(json_file).exists():
             print(f"❌ {json_file} not found")
             continue
-            
-        with open(json_file, 'r') as f:
-            data = json.load(f)
+        
+        # 修复音频路径
+        data, fixed_count, missing_count = fix_audio_paths(json_file, AUDIO_DIR)
         
         split_dir = output_path / split
         split_dir.mkdir(exist_ok=True)
         
-        valid_count = 0
-        durations = []
+        valid_samples = []
         emotion_counts = {}
-        missing_files = []
         
-        # 创建ASR多任务格式文件
-        with open(split_dir / "speech.scp", 'w') as scp_f, \\
-             open(split_dir / "text", 'w') as text_f, \\
-             open(split_dir / "emotion.txt", 'w') as emo_f, \\
+        # 收集有效样本
+        for utt_id, info in data.items():
+            wav_path = info['wav']
+            emotion = info['emo']
+            
+            # 检查文件存在且标签有效
+            if os.path.exists(wav_path) and emotion in emotion_map:
+                valid_samples.append((utt_id, wav_path, emotion_map[emotion]))
+                emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+        
+        print(f"✅ {split}: {len(valid_samples)} valid samples from {len(data)} total")
+        
+        # 写入文件
+        with open(split_dir / "speech.scp", 'w') as scp_f, \
+             open(split_dir / "emotion.txt", 'w') as emo_f, \
              open(split_dir / "utt2spk", 'w') as spk_f:
             
-            for utt_id, info in data.items():
-                wav_path = info['wav']
-                emotion = info['emo']
-                # 从转录文本获取，如果没有就用占位符
-                text = info.get('transcript', '<unk>')
-                duration = info.get('length', 0)
-                
-                # 检查文件存在且标签有效
-                if not os.path.exists(wav_path):
-                    missing_files.append(wav_path)
-                    continue
-                    
-                if emotion not in emotion_map:
-                    print(f"⚠️  Unknown emotion '{emotion}' for {utt_id}")
-                    continue
-                
-                # 写入ASR多任务格式文件
-                scp_f.write(f"{utt_id} {wav_path}\\n")
-                text_f.write(f"{utt_id} {text}\\n")  # ASR目标
-                emo_f.write(f"{utt_id} {emotion_map[emotion]}\\n")  # SER目标
+            for utt_id, wav_path, emotion_idx in valid_samples:
+                scp_f.write(f"{utt_id} {wav_path}\n")
+                emo_f.write(f"{utt_id} {emotion_idx}\n")
                 
                 # 简单的speaker ID
                 speaker_id = '_'.join(utt_id.split('_')[:2])
-                spk_f.write(f"{utt_id} {speaker_id}\\n")
-                
-                valid_count += 1
-                durations.append(duration)
-                emotion_counts[emotion] = emotion_counts.get(emotion, 0) + 1
+                spk_f.write(f"{utt_id} {speaker_id}\n")
         
-        # 统计信息
-        stats[split] = {
-            'count': valid_count,
-            'missing_files': len(missing_files),
-            'duration_mean': np.mean(durations) if durations else 0,
-            'duration_std': np.std(durations) if durations else 0,
-            'emotion_dist': emotion_counts
+        total_stats[split] = {
+            'total_samples': len(data),
+            'valid_samples': len(valid_samples),
+            'missing_files': len(data) - len(valid_samples),
+            'emotion_distribution': emotion_counts
         }
-        
-        print(f"✅ {split}: {valid_count} valid samples")
-        if missing_files:
-            print(f"⚠️  {split}: {len(missing_files)} missing files")
     
-    # 保存数据集信息
-    dataset_info = {
-        "dataset_name": "MSP-PODCAST-ASR-MultiTask",
-        "task": "ASR + 10-class emotion recognition",
-        "num_classes": 10,
-        "emotion_names": emotion_names,
-        "emotion_mapping": emotion_map,
-        "stats": stats,
-        "format": "ASR multi-task (text + emotion)",
-        "data_source": "Cloud cluster: /data/user_data/esthers/SER_MSP"
-    }
+    # 保存统计信息
+    with open(output_path / "stats.json", 'w') as f:
+        json.dump(total_stats, f, indent=2)
     
-    with open(output_path / "dataset_info.json", 'w') as f:
-        json.dump(dataset_info, f, indent=2, ensure_ascii=False)
+    print(f"\n✅ Data prepared in {output_dir}/")
+    print("📊 Statistics:")
+    for split, stats in total_stats.items():
+        print(f"  {split}: {stats['valid_samples']}/{stats['total_samples']} valid samples")
     
-    print(f"\\n✅ ASR multi-task data prepared in {output_dir}/")
-    print("📝 Format: speech.scp + text + emotion.txt (ASR + SER)")
-    
-    return dataset_info
+    return total_stats
 
-if __name__ == "__main__":
-    prepare_asr_multitask_data()
-'''
-    
-    with open("fixed_cloud_data_prep.py", 'w') as f:
-        f.write(data_prep_code)
-    
-    print("✅ Created fixed_cloud_data_prep.py")
+# ============================================================================
+# 修复2：简化的ESP-net配置
+# ============================================================================
 
-def create_asr_multitask_config():
-    """创建ASR多任务配置文件"""
+def create_fixed_espnet_config():
+    """创建修复后的ESP-net配置"""
     
-    config = '''# asr_multitask_config.yaml - ASR多任务配置（文本+情感）
+    config = """# Fixed ESP-net ASR configuration
 batch_type: numel
 batch_size: 16
-max_epoch: 50
-patience: 10
+max_epoch: 30
+patience: 5
 seed: 42
 num_workers: 4
-log_interval_steps: 100
+log_interval: 100
 grad_clip: 5.0
 accum_grad: 1
 
-# 优化器配置
+# Optimizer
 optim: adamw
 optim_conf:
   lr: 0.0001
   weight_decay: 0.001
 
-# 学习率调度器
+# Scheduler
 scheduler: warmuplr
 scheduler_conf:
   warmup_steps: 1000
 
-# 模型配置 - 使用Conformer进行多任务学习
+# Model configuration
 model: espnet
 model_conf:
-  # 编码器
-  encoder: conformer
-  encoder_conf:
-    output_size: 256
-    attention_heads: 4
-    linear_units: 1024
-    num_blocks: 8
-    dropout_rate: 0.1
-    attention_dropout_rate: 0.0
-    input_layer: conv2d
-    normalize_before: true
-    
-  # ASR解码器
-  decoder: transformer
-  decoder_conf:
-    attention_heads: 4
-    linear_units: 1024
-    num_blocks: 4
-    dropout_rate: 0.1
-    
-  # 多任务配置 - 关键部分
   ctc_weight: 0.3
   lsm_weight: 0.1
+  length_normalized_loss: false
   
-  # 添加情感分类头
-  aux_ctc_tasks:
-    - name: emotion
-      ctc_weight: 0.3
-      ctc_conf:
-        dropout_rate: 0.0
-        
-# 预处理器配置
+# Encoder
+encoder: conformer
+encoder_conf:
+  output_size: 256
+  attention_heads: 4
+  linear_units: 1024
+  num_blocks: 6
+  dropout_rate: 0.1
+  attention_dropout_rate: 0.0
+  input_layer: conv2d
+  normalize_before: true
+  
+# Decoder
+decoder: transformer
+decoder_conf:
+  attention_heads: 4
+  linear_units: 1024
+  num_blocks: 3
+  dropout_rate: 0.1
+
+# Frontend
 frontend: default
 frontend_conf:
-  # 特征提取
   n_fft: 512
   win_length: 400
   hop_length: 160
-  
+
 # SpecAugment
 specaug: specaug
 specaug_conf:
@@ -252,42 +219,28 @@ specaug_conf:
   time_mask_width_range: [0, 40]
   num_time_mask: 2
 
-# 最佳模型选择
+# Best model criterion
 best_model_criterion:
   - ["valid", "acc", "max"]
   - ["valid", "loss", "min"]
 
-# 其他配置
+# Other settings
 resume: true
 keep_nbest_models: 3
 use_tensorboard: true
-'''
+"""
     
-    with open("asr_multitask_config.yaml", 'w') as f:
+    with open("fixed_espnet_config.yaml", 'w') as f:
         f.write(config)
     
-    print("✅ Created asr_multitask_config.yaml")
+    print("✅ Created fixed_espnet_config.yaml")
 
-def create_simple_pytorch_ser():
-    """创建简单的PyTorch SER基线（备选方案）"""
-    
-    ser_code = '''#!/usr/bin/env python3
-# simple_pytorch_ser.py - 简单PyTorch SER基线
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchaudio
-import json
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import f1_score, classification_report
-from pathlib import Path
-import logging
-from tqdm import tqdm
+# ============================================================================
+# 修复3：完整的PyTorch SER实现
+# ============================================================================
 
 class SimpleSERDataset(Dataset):
-    """简单SER数据集"""
+    """修复后的SER数据集"""
     def __init__(self, data_dir, split='train', max_length=16000*5):
         self.max_length = max_length
         self.data = []
@@ -302,14 +255,20 @@ class SimpleSERDataset(Dataset):
         speech_data = {}
         with open(speech_file, 'r') as f:
             for line in f:
-                utt_id, path = line.strip().split(None, 1)
-                speech_data[utt_id] = path
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2:
+                    utt_id, path = parts
+                    speech_data[utt_id] = path
         
         with open(emotion_file, 'r') as f:
             for line in f:
-                utt_id, emotion = line.strip().split()
-                if utt_id in speech_data:
-                    self.data.append((speech_data[utt_id], int(emotion)))
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    utt_id, emotion = parts
+                    if utt_id in speech_data:
+                        self.data.append((speech_data[utt_id], int(emotion)))
+        
+        print(f"📊 {split} dataset: {len(self.data)} samples")
     
     def __len__(self):
         return len(self.data)
@@ -340,25 +299,35 @@ class SimpleSERDataset(Dataset):
             return waveform.squeeze(0), emotion
             
         except Exception as e:
-            print(f"Error loading {wav_path}: {e}")
+            print(f"⚠️  Error loading {wav_path}: {e}")
             return torch.zeros(self.max_length), 0
 
 class SimpleSERModel(nn.Module):
-    """简单的SER模型"""
+    """改进的SER模型"""
     def __init__(self, num_classes=10):
         super().__init__()
         
-        # 简单的CNN特征提取器
+        # CNN特征提取器
         self.features = nn.Sequential(
+            # 第一层：粗粒度特征
             nn.Conv1d(1, 64, kernel_size=80, stride=16),
             nn.ReLU(),
             nn.BatchNorm1d(64),
+            nn.Dropout(0.1),
+            
+            # 第二层：中等粒度特征
             nn.Conv1d(64, 128, kernel_size=3, stride=2),
             nn.ReLU(),
             nn.BatchNorm1d(128),
+            nn.Dropout(0.1),
+            
+            # 第三层：细粒度特征
             nn.Conv1d(128, 256, kernel_size=3, stride=2),
             nn.ReLU(),
             nn.BatchNorm1d(256),
+            nn.Dropout(0.1),
+            
+            # 全局平均池化
             nn.AdaptiveAvgPool1d(1)
         )
         
@@ -367,54 +336,94 @@ class SimpleSERModel(nn.Module):
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, num_classes)
         )
     
     def forward(self, x):
+        # x: (batch, time)
         x = x.unsqueeze(1)  # (batch, 1, time)
         x = self.features(x)  # (batch, 256, 1)
         x = x.squeeze(-1)  # (batch, 256)
         x = self.classifier(x)  # (batch, num_classes)
         return x
 
-def train_simple_ser():
-    """训练简单SER模型"""
-    print("🚀 Training Simple PyTorch SER Model...")
+def train_pytorch_ser():
+    """训练PyTorch SER模型"""
+    print("🚀 Training PyTorch SER Model...")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"🖥️  Using device: {device}")
+    
+    # 检查数据是否准备好
+    if not Path("data/train/speech.scp").exists():
+        print("❌ Data not prepared. Running data preparation first...")
+        stats = prepare_fixed_data()
+        
+        # 检查是否有有效数据
+        if all(stats[split]['valid_samples'] == 0 for split in ['train', 'valid']):
+            print("❌ No valid samples found after data preparation!")
+            print("🔍 Please check:")
+            print(f"  1. Audio files are in: {AUDIO_DIR}")
+            print(f"  2. JSON files contain correct paths")
+            return False
     
     # 数据加载
     try:
         train_dataset = SimpleSERDataset("data", "train")
         valid_dataset = SimpleSERDataset("data", "valid")
         
-        train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2)
-        valid_loader = DataLoader(valid_dataset, batch_size=8, shuffle=False, num_workers=2)
+        if len(train_dataset) == 0 or len(valid_dataset) == 0:
+            print("❌ Empty datasets!")
+            return False
         
-        print(f"Dataset sizes - Train: {len(train_dataset)}, Valid: {len(valid_dataset)}")
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=8, 
+            shuffle=True, 
+            num_workers=2,
+            pin_memory=True if device.type == 'cuda' else False
+        )
+        valid_loader = DataLoader(
+            valid_dataset, 
+            batch_size=8, 
+            shuffle=False, 
+            num_workers=2,
+            pin_memory=True if device.type == 'cuda' else False
+        )
+        
+        print(f"📊 Dataset sizes - Train: {len(train_dataset)}, Valid: {len(valid_dataset)}")
+        
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         return False
     
-    # 模型
+    # 模型设置
     model = SimpleSERModel(num_classes=10).to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
+    
+    print(f"🔧 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     best_macro_f1 = 0.0
+    patience_counter = 0
+    max_patience = 5
     
     # 训练循环
-    for epoch in range(10):  # 简化为10个epoch
-        print(f"\\nEpoch {epoch+1}/10")
+    for epoch in range(20):
+        print(f"\n📈 Epoch {epoch+1}/20")
         
-        # 训练
+        # === 训练阶段 ===
         model.train()
         train_loss = 0
         train_correct = 0
         train_total = 0
         
-        for batch_idx, (audio, labels) in enumerate(tqdm(train_loader, desc="Training")):
+        train_pbar = tqdm(train_loader, desc="Training", leave=False)
+        for batch_idx, (audio, labels) in enumerate(train_pbar):
             audio, labels = audio.to(device), labels.to(device)
             
             optimizer.zero_grad()
@@ -427,18 +436,25 @@ def train_simple_ser():
             _, predicted = outputs.max(1)
             train_total += labels.size(0)
             train_correct += predicted.eq(labels).sum().item()
+            
+            # 更新进度条
+            train_pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Acc': f'{100.*train_correct/train_total:.2f}%'
+            })
         
         train_acc = 100. * train_correct / train_total
         avg_train_loss = train_loss / len(train_loader)
         
-        # 验证
+        # === 验证阶段 ===
         model.eval()
         val_loss = 0
         all_preds = []
         all_labels = []
         
         with torch.no_grad():
-            for audio, labels in tqdm(valid_loader, desc="Validation"):
+            val_pbar = tqdm(valid_loader, desc="Validation", leave=False)
+            for audio, labels in val_pbar:
                 audio, labels = audio.to(device), labels.to(device)
                 outputs = model(audio)
                 loss = criterion(outputs, labels)
@@ -448,183 +464,169 @@ def train_simple_ser():
                 
                 all_preds.extend(predicted.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
+                
+                val_pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
         
         # 计算指标
         val_acc = 100. * np.mean(np.array(all_preds) == np.array(all_labels))
         avg_val_loss = val_loss / len(valid_loader)
         macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
         
-        print(f"Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%")
-        print(f"Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
-        print(f"Macro-F1: {macro_f1:.4f}")
+        # 学习率调度
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+        
+        # 打印结果
+        print(f"🏋️  Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        print(f"📊 Valid Loss: {avg_val_loss:.4f}, Valid Acc: {val_acc:.2f}%")
+        print(f"🎯 Macro-F1: {macro_f1:.4f}, LR: {current_lr:.6f}")
         
         # 保存最佳模型
         if macro_f1 > best_macro_f1:
             best_macro_f1 = macro_f1
-            torch.save(model.state_dict(), "best_simple_ser_model.pth")
-            print(f"🎯 New best Macro-F1: {best_macro_f1:.4f}")
+            patience_counter = 0
+            
+            # 保存模型
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_macro_f1': best_macro_f1,
+                'val_acc': val_acc,
+                'val_loss': avg_val_loss
+            }
+            torch.save(checkpoint, "best_ser_model.pth")
+            print(f"💾 New best model saved! Macro-F1: {best_macro_f1:.4f}")
+            
+        else:
+            patience_counter += 1
+            print(f"⏳ Patience: {patience_counter}/{max_patience}")
+            
+            if patience_counter >= max_patience:
+                print("🛑 Early stopping triggered!")
+                break
     
-    print(f"\\n✅ Training completed! Best Macro-F1: {best_macro_f1:.4f}")
+    # 最终评估
+    print(f"\n🎉 Training completed!")
+    print(f"🏆 Best Macro-F1: {best_macro_f1:.4f}")
+    
+    # 生成详细报告
+    if len(set(all_labels)) > 1:
+        emotion_names = [
+            "Neutral", "Happy", "Sad", "Angry", "Fear",
+            "Disgust", "Surprise", "Contempt", "Other", "Unknown"
+        ]
+        try:
+            report = classification_report(
+                all_labels, 
+                all_preds,
+                target_names=emotion_names[:len(set(all_labels))],
+                zero_division=0,
+                digits=4
+            )
+            print(f"\n📋 Final Classification Report:\n{report}")
+        except:
+            print("⚠️  Could not generate detailed classification report")
+    
     return True
 
-if __name__ == "__main__":
-    train_simple_ser()
-'''
-    
-    with open("simple_pytorch_ser.py", 'w') as f:
-        f.write(ser_code)
-    
-    print("✅ Created simple_pytorch_ser.py")
+# ============================================================================
+# 主程序
+# ============================================================================
 
-def check_cloud_environment():
-    """检查云端环境"""
-    print("🔍 Checking cloud environment...")
+def check_environment():
+    """检查环境"""
+    print("🔍 Checking environment...")
     
     # 检查数据路径
-    if not Path(DATA_ROOT).exists():
-        print(f"❌ Data root not found: {DATA_ROOT}")
-        return False
+    checks = [
+        (DATA_ROOT, "Data root"),
+        (AUDIO_DIR, "Audio directory"),
+    ]
     
-    if not Path(AUDIO_DIR).exists():
-        print(f"❌ Audio directory not found: {AUDIO_DIR}")
-        return False
+    for path, name in checks:
+        if Path(path).exists():
+            print(f"✅ {name}: {path}")
+        else:
+            print(f"❌ {name} not found: {path}")
+            return False
     
     # 检查JSON文件
     for split, json_path in JSON_FILES.items():
-        if not Path(json_path).exists():
-            print(f"❌ Missing JSON file: {json_path}")
+        if Path(json_path).exists():
+            print(f"✅ {split} JSON: {json_path}")
+        else:
+            print(f"❌ {split} JSON not found: {json_path}")
             return False
-        print(f"✅ Found {split}: {json_path}")
     
     # 检查GPU
     if torch.cuda.is_available():
-        print(f"✅ CUDA available: {torch.cuda.get_device_name()}")
+        print(f"✅ CUDA: {torch.cuda.get_device_name()}")
     else:
         print("⚠️  No CUDA, using CPU")
     
     return True
 
-def install_dependencies():
-    """安装必需的依赖"""
-    print("📦 Installing dependencies...")
-    
-    packages = [
-        "torch",
-        "torchaudio", 
-        "transformers",
-        "scikit-learn",
-        "numpy",
-        "tqdm"
-    ]
-    
-    for package in packages:
-        try:
-            __import__(package)
-            print(f"✅ {package}")
-        except ImportError:
-            print(f"🔧 Installing {package}...")
-            subprocess.run([sys.executable, "-m", "pip", "install", package], check=True)
-
-def run_asr_multitask_training():
-    """运行ASR多任务训练（如果ESP-net可用）"""
-    print("🚀 Attempting ASR multi-task training...")
-    
-    # 数据准备
-    try:
-        from fixed_cloud_data_prep import prepare_asr_multitask_data
-        prepare_asr_multitask_data()
-    except Exception as e:
-        print(f"❌ Data preparation failed: {e}")
-        return False
-    
-    # ASR训练命令
-    exp_dir = Path("exp/asr_multitask_ser")
-    exp_dir.mkdir(parents=True, exist_ok=True)
-    
-    train_cmd = [
-        sys.executable, "-m", "espnet2.bin.asr_train",
-        "--train_data_path_and_name_and_type", "data/train/speech.scp,speech,sound",
-        "--train_data_path_and_name_and_type", "data/train/text,text,text",
-        "--train_data_path_and_name_and_type", "data/train/emotion.txt,emotion,text_int",
-        "--valid_data_path_and_name_and_type", "data/valid/speech.scp,speech,sound",
-        "--valid_data_path_and_name_and_type", "data/valid/text,text,text", 
-        "--valid_data_path_and_name_and_type", "data/valid/emotion.txt,emotion,text_int",
-        "--output_dir", str(exp_dir),
-        "--config", "asr_multitask_config.yaml",
-        "--ngpu", "1" if torch.cuda.is_available() else "0",
-        "--num_workers", "4",
-    ]
-    
-    print("ASR Multi-task training command:")
-    print(" ".join(train_cmd))
-    
-    try:
-        subprocess.run(train_cmd, check=True)
-        print("✅ ASR multi-task training completed!")
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"❌ ASR training failed: {e}")
-        print("🔄 Falling back to simple PyTorch SER...")
-        return False
-
-def run_simple_pytorch_training():
-    """运行简单PyTorch训练（备选方案）"""
-    print("🔄 Running simple PyTorch SER training...")
-    
-    try:
-        # 导入并运行
-        exec(open("simple_pytorch_ser.py").read())
-        return True
-    except Exception as e:
-        print(f"❌ Simple PyTorch training failed: {e}")
-        return False
-
 def main():
-    print("🌐 Fixed Cloud Cluster SER Training")
+    print("🌐 Completely Fixed Cloud SER Training")
     print("=" * 60)
     print(f"📁 Data root: {DATA_ROOT}")
     print(f"🎵 Audio dir: {AUDIO_DIR}")
     print("=" * 60)
     
     # 1. 环境检查
-    if not check_cloud_environment():
+    if not check_environment():
         print("❌ Environment check failed")
         return
     
-    # 2. 安装依赖
+    # 2. 数据准备
+    print("\n🔧 Step 1: Data Preparation")
     try:
-        install_dependencies()
-    except Exception as e:
-        print(f"⚠️  Dependency installation issue: {e}")
-    
-    # 3. 创建必需文件
-    print("\\n🔧 Creating configuration files...")
-    create_fixed_data_prep()
-    create_asr_multitask_config()
-    create_simple_pytorch_ser()
-    
-    # 4. 尝试训练
-    print("\\n🚀 Starting training...")
-    
-    # 方案1: ASR多任务（ESP-net推荐）
-    if run_asr_multitask_training():
-        print("\\n🎉 ASR multi-task training successful!")
-        print("📊 This approach predicts both text and emotion simultaneously")
-    else:
-        # 方案2: 简单PyTorch SER（备选）
-        print("\\n🔄 Trying simple PyTorch approach...")
-        if run_simple_pytorch_training():
-            print("\\n🎉 Simple PyTorch SER training successful!")
-        else:
-            print("\\n❌ All training approaches failed")
+        stats = prepare_fixed_data()
+        
+        # 检查是否有足够的数据
+        train_samples = stats.get('train', {}).get('valid_samples', 0)
+        valid_samples = stats.get('valid', {}).get('valid_samples', 0)
+        
+        if train_samples == 0 or valid_samples == 0:
+            print("❌ Insufficient valid data found!")
+            print("🔍 Troubleshooting suggestions:")
+            print(f"  1. Check if audio files exist in: {AUDIO_DIR}")
+            print(f"  2. Verify JSON file paths are correct")
+            print(f"  3. Ensure audio file extensions match (.wav)")
             return
+        
+        print(f"✅ Found {train_samples} training samples, {valid_samples} validation samples")
+        
+    except Exception as e:
+        print(f"❌ Data preparation failed: {e}")
+        return
     
-    print("\\n" + "=" * 60)
-    print("🎯 Training completed!")
-    print("📁 Check results in:")
-    print("  - exp/asr_multitask_ser/ (if ASR multi-task worked)")
-    print("  - best_simple_ser_model.pth (if PyTorch worked)")
-    print("=" * 60)
+    # 3. 创建配置文件
+    print("\n🔧 Step 2: Configuration")
+    create_fixed_espnet_config()
+    
+    # 4. 训练模型
+    print("\n🚀 Step 3: Model Training")
+    
+    try:
+        if train_pytorch_ser():
+            print("\n🎉 Training completed successfully!")
+            print("\n📊 Results:")
+            print("  - Model: best_ser_model.pth")
+            print("  - Logs: Training progress shown above")
+            print("\n🎯 Next steps:")
+            print("  - Test the model on test set")
+            print("  - Analyze per-class performance")
+            print("  - Consider hyperparameter tuning")
+        else:
+            print("\n❌ Training failed")
+            
+    except Exception as e:
+        print(f"\n❌ Training error: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
