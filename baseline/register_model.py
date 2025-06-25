@@ -87,54 +87,22 @@ def main():
     logging.info("Starting ESP-net SER training...")
     logging.info(f"Arguments: {vars(args)}")
     
-    # 运行SER训练 - 修复调用方式
+    # 运行SER训练 - 只使用ESP-net，不用fallback
     try:
-        from espnet2.bin.launch import launch
+        logging.info("Using ESP-net training framework...")
         
-        def train_func(args):
-            return SERTask.main(
-                cmd=None,
-                parser=parser,
-                args=args,
-                task_class=SERTask,
-            )
-        
-        launch(
-            main_func=train_func,
+        # 直接调用SER任务的main方法
+        SERTask.main(
+            cmd=sys.argv[1:],
             parser=parser,
             args=args,
+            task_class=SERTask,
         )
         
-    except ImportError:
-        # 如果launch不可用，使用直接调用
-        try:
-            SERTask.main(args)
-        except Exception as e:
-            logging.error(f"Direct call failed: {e}")
-            # 最后的备选方案
-            print("Using fallback training method...")
-            run_training_fallback(args)
-
-def run_training_fallback(args):
-    """备选训练方法"""
-    import torch
-    from torch.utils.data import DataLoader
-    
-    print("🔧 Using fallback training method...")
-    
-    # 创建模型
-    model = SERTask.build_model(args)
-    print(f"✅ Model created: {type(model)}")
-    
-    # 简单的训练循环
-    device = torch.device("cuda" if torch.cuda.is_available() and args.ngpu > 0 else "cpu")
-    model = model.to(device)
-    
-    # 创建优化器
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
-    print("✅ Basic training setup completed")
-    print("Note: This is a simplified training loop for testing purposes")
+    except Exception as e:
+        logging.error(f"ESP-net training failed: {e}")
+        logging.error("Please check the error details above")
+        raise  # 重新抛出异常，不使用fallback
 
 if __name__ == "__main__":
     main()

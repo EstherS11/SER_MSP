@@ -18,6 +18,46 @@ from espnet2.train.class_choices import ClassChoices
 from espnet2.train.preprocessor import CommonPreprocessor
 from espnet2.train.trainer import Trainer
 
+# 安全导入CommonCollateFn
+try:
+    from espnet2.train.collate_fn import CommonCollateFn
+except ImportError:
+    try:
+        from espnet2.train.dataset import CommonCollateFn
+    except ImportError:
+        # 如果都导入失败，提供一个简单的实现
+        class CommonCollateFn:
+            def __init__(self, float_pad_value=0.0, int_pad_value=-1):
+                self.float_pad_value = float_pad_value
+                self.int_pad_value = int_pad_value
+            
+            def __call__(self, batch):
+                # 简单的collate function实现
+                return batch
+
+from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
+from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
+from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
+
+# 如果make_pad_mask不可用，提供备选实现
+def make_pad_mask_fallback(lengths, max_len=None):
+    """备选的pad mask实现"""
+    batch_size = lengths.size(0)
+    if max_len is None:
+        max_len = lengths.max().item()
+    
+    seq_range = torch.arange(0, max_len, dtype=lengths.dtype, device=lengths.device)
+    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
+    seq_length_expand = lengths.unsqueeze(1).expand_as(seq_range_expand)
+    
+    return seq_range_expand >= seq_length_expand
+
+# 尝试导入，如果失败则使用备选
+try:
+    from espnet.nets.pytorch_backend.nets_utils import make_pad_mask
+except ImportError:
+    make_pad_mask = make_pad_mask_fallback
+
 class SERes2NetBlock(nn.Module):
     """ECAPA-TDNN的SE-Res2Net块"""
     def __init__(self, in_channels, out_channels, kernel_size, dilation, scale=8, se_channels=128):
