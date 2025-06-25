@@ -14,7 +14,7 @@ module load cuda/11.8
 module load python/3.9
 
 # Activate conda environment
-source activate your_env_name
+source /data/user_data/esthers/SER_MSP/msp/bin/activate
 
 # Set CUDA devices
 export CUDA_VISIBLE_DEVICES=0
