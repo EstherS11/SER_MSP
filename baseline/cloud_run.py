@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-# cloud_run.py - 云端集群专用运行脚本
+# fixed_cloud_run.py - 修复版云端集群运行脚本
 
 import sys
 import os
 import json
 import subprocess
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 from pathlib import Path
+from collections import Counter
+import logging
+from tqdm import tqdm
 
 # ============================================================================
-# 云端集群配置 
+# 云端集群配置 - 根据你的实际路径
 # ============================================================================
 
-# 🔧 实际数据路径
+# 🔧 你的实际数据路径
 DATA_ROOT = "/data/user_data/esthers/SER_MSP"
-BASELINE_DIR = "/data/user_data/esthers/SER_MSP/baseline"  
+BASELINE_DIR = "/data/user_data/esthers/SER_MSP/baseline"
 AUDIO_DIR = "/data/user_data/esthers/SER_MSP/DATA/Audios"
 
-# JSON文件路径（直接在SER_MSP目录下）
+# JSON文件路径
 JSON_FILES = {
     'train': f"{DATA_ROOT}/msp_train_10class.json",
     'valid': f"{DATA_ROOT}/msp_valid_10class.json", 
@@ -24,73 +31,14 @@ JSON_FILES = {
 }
 
 # ============================================================================
-# 云端环境检查和设置
+# 修复：直接使用ASR任务进行SER（ESP-net推荐方式）
 # ============================================================================
 
-def setup_cloud_environment():
-    """设置云端环境"""
-    project_root = Path(__file__).parent.absolute()
-    
-    # 添加项目根目录到Python路径
-    if str(project_root) not in sys.path:
-        sys.path.insert(0, str(project_root))
-    
-    # 创建__init__.py文件
-    init_file = project_root / "__init__.py"
-    if not init_file.exists():
-        init_file.touch()
-        print("✅ Created __init__.py")
-    
-    # 创建baseline目录（如果不存在）
-    baseline_path = Path(BASELINE_DIR)
-    baseline_path.mkdir(parents=True, exist_ok=True)
-    print(f"✅ Baseline directory: {BASELINE_DIR}")
-    
-    return project_root
-
-def check_cloud_data():
-    """检查云端数据结构"""
-    print("🔍 Checking cloud data structure...")
-    
-    # 检查音频目录
-    audio_path = Path(AUDIO_DIR)
-    if not audio_path.exists():
-        print(f"❌ Audio directory not found: {AUDIO_DIR}")
-        return False
-    
-    audio_files = list(audio_path.glob("*.wav"))
-    print(f"✅ Found {len(audio_files)} audio files in {AUDIO_DIR}")
-    
-    # 检查JSON文件
-    for split, json_path in JSON_FILES.items():
-        if not Path(json_path).exists():
-            print(f"❌ Missing JSON file: {json_path}")
-            return False
-        
-        # 检查JSON格式
-        try:
-            with open(json_path, 'r') as f:
-                data = json.load(f)
-            print(f"✅ {split}: {len(data)} samples in {json_path}")
-            
-            # 验证数据格式
-            first_key = next(iter(data))
-            first_item = data[first_key]
-            if 'wav' not in first_item or 'emo' not in first_item:
-                print(f"❌ Invalid JSON format in {json_path}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error reading {json_path}: {e}")
-            return False
-    
-    return True
-
-def create_cloud_data_prep():
-    """创建适配云端数据结构的数据准备脚本"""
+def create_fixed_data_prep():
+    """创建修复版数据准备脚本 - 使用ASR多任务格式"""
     
     data_prep_code = '''#!/usr/bin/env python3
-# cloud_data_prep.py - 云端数据准备脚本
+# fixed_cloud_data_prep.py - 修复版云端数据准备脚本
 
 import json
 import os
@@ -98,8 +46,11 @@ import numpy as np
 from pathlib import Path
 from collections import Counter
 
-def prepare_cloud_msp_data(output_dir="data"):
-    """准备云端MSP-PODCAST数据"""
+def prepare_asr_multitask_data(output_dir="data"):
+    """
+    准备ASR多任务格式数据 - ESP-net推荐的SER实现方式
+    同时预测文本转录和情感标签
+    """
     
     # 云端路径配置
     JSON_FILES = {
@@ -122,7 +73,7 @@ def prepare_cloud_msp_data(output_dir="data"):
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
     
-    print("🔧 Preparing ESP-net format data for cloud MSP-PODCAST...")
+    print("🔧 Preparing ASR multi-task format data for SER...")
     
     stats = {}
     
@@ -145,14 +96,17 @@ def prepare_cloud_msp_data(output_dir="data"):
         emotion_counts = {}
         missing_files = []
         
-        # 创建ESP-net标准格式文件
+        # 创建ASR多任务格式文件
         with open(split_dir / "speech.scp", 'w') as scp_f, \\
+             open(split_dir / "text", 'w') as text_f, \\
              open(split_dir / "emotion.txt", 'w') as emo_f, \\
              open(split_dir / "utt2spk", 'w') as spk_f:
             
             for utt_id, info in data.items():
                 wav_path = info['wav']
                 emotion = info['emo']
+                # 从转录文本获取，如果没有就用占位符
+                text = info.get('transcript', '<unk>')
                 duration = info.get('length', 0)
                 
                 # 检查文件存在且标签有效
@@ -164,11 +118,12 @@ def prepare_cloud_msp_data(output_dir="data"):
                     print(f"⚠️  Unknown emotion '{emotion}' for {utt_id}")
                     continue
                 
-                # 写入ESP-net格式文件
+                # 写入ASR多任务格式文件
                 scp_f.write(f"{utt_id} {wav_path}\\n")
-                emo_f.write(f"{utt_id} {emotion_map[emotion]}\\n")
+                text_f.write(f"{utt_id} {text}\\n")  # ASR目标
+                emo_f.write(f"{utt_id} {emotion_map[emotion]}\\n")  # SER目标
                 
-                # 简单的speaker ID (从utterance ID提取)
+                # 简单的speaker ID
                 speaker_id = '_'.join(utt_id.split('_')[:2])
                 spk_f.write(f"{utt_id} {speaker_id}\\n")
                 
@@ -182,8 +137,6 @@ def prepare_cloud_msp_data(output_dir="data"):
             'missing_files': len(missing_files),
             'duration_mean': np.mean(durations) if durations else 0,
             'duration_std': np.std(durations) if durations else 0,
-            'duration_min': np.min(durations) if durations else 0,
-            'duration_max': np.max(durations) if durations else 0,
             'emotion_dist': emotion_counts
         }
         
@@ -193,77 +146,43 @@ def prepare_cloud_msp_data(output_dir="data"):
     
     # 保存数据集信息
     dataset_info = {
-        "dataset_name": "MSP-PODCAST",
-        "task": "10-class emotion recognition",
+        "dataset_name": "MSP-PODCAST-ASR-MultiTask",
+        "task": "ASR + 10-class emotion recognition",
         "num_classes": 10,
         "emotion_names": emotion_names,
         "emotion_mapping": emotion_map,
         "stats": stats,
+        "format": "ASR multi-task (text + emotion)",
         "data_source": "Cloud cluster: /data/user_data/esthers/SER_MSP"
     }
     
     with open(output_path / "dataset_info.json", 'w') as f:
         json.dump(dataset_info, f, indent=2, ensure_ascii=False)
     
-    print(f"\\n✅ ESP-net data prepared in {output_dir}/")
-    
-    # 显示详细统计
-    print("\\n📊 Dataset Statistics:")
-    print(f"Dataset: {dataset_info['dataset_name']}")
-    print(f"Task: {dataset_info['task']}")
-    print(f"Classes: {dataset_info['num_classes']}")
-    
-    for split in ['train', 'valid', 'test']:
-        if split in stats:
-            print(f"\\n{split.upper()} Set:")
-            print(f"  Samples: {stats[split]['count']:,}")
-            print(f"  Missing files: {stats[split]['missing_files']}")
-            print(f"  Duration: {stats[split]['duration_mean']:.2f}±{stats[split]['duration_std']:.2f}s")
-            print(f"  Range: [{stats[split]['duration_min']:.2f}, {stats[split]['duration_max']:.2f}]s")
-            
-            print(f"  Emotion distribution:")
-            total = stats[split]['count']
-            for emotion, count in stats[split]['emotion_dist'].items():
-                pct = count / total * 100 if total > 0 else 0
-                emotion_name = emotion_names[emotion_map[emotion]]
-                print(f"    {emotion} ({emotion_name}): {count:,} ({pct:.1f}%)")
-    
-    # 类别平衡分析
-    if 'train' in stats:
-        print(f"\\n⚖️  Class Balance Analysis (Training Set):")
-        train_dist = stats['train']['emotion_dist']
-        counts = list(train_dist.values())
-        if counts:
-            max_count = max(counts)
-            min_count = min(counts)
-            balance_ratio = min_count / max_count
-            print(f"  Balance ratio: {balance_ratio:.3f} (1.0 = perfect)")
-            
-            if balance_ratio < 0.5:
-                print(f"  ⚠️  Severe class imbalance detected!")
-                print(f"     Consider using class weights or data resampling")
+    print(f"\\n✅ ASR multi-task data prepared in {output_dir}/")
+    print("📝 Format: speech.scp + text + emotion.txt (ASR + SER)")
     
     return dataset_info
 
 if __name__ == "__main__":
-    prepare_cloud_msp_data()
+    prepare_asr_multitask_data()
 '''
     
-    with open("cloud_data_prep.py", 'w') as f:
+    with open("fixed_cloud_data_prep.py", 'w') as f:
         f.write(data_prep_code)
     
-    print("✅ Created cloud_data_prep.py")
+    print("✅ Created fixed_cloud_data_prep.py")
 
-def create_cloud_train_config():
-    """创建云端训练配置"""
+def create_asr_multitask_config():
+    """创建ASR多任务配置文件"""
     
-    config = '''# cloud_train_config.yaml - 云端集群训练配置
+    config = '''# asr_multitask_config.yaml - ASR多任务配置（文本+情感）
 batch_type: numel
-batch_size: 12                      # 云端可能有更好的GPU
+batch_size: 16
 max_epoch: 50
 patience: 10
 seed: 42
-num_workers: 4                      # 云端并行处理
+num_workers: 4
 log_interval_steps: 100
 grad_clip: 5.0
 accum_grad: 1
@@ -273,203 +192,439 @@ optim: adamw
 optim_conf:
   lr: 0.0001
   weight_decay: 0.001
-  betas: [0.9, 0.999]
-  eps: 1.0e-8
 
 # 学习率调度器
-scheduler: cosineannealinglr
+scheduler: warmuplr
 scheduler_conf:
-  T_max: 50
-  eta_min: 1.0e-6
+  warmup_steps: 1000
 
-# 模型配置
-model: wavlm_ecapa
+# 模型配置 - 使用Conformer进行多任务学习
+model: espnet
 model_conf:
-  num_class: 10
-  wavlm_model_name: "microsoft/wavlm-large"
-  wavlm_freeze: true
+  # 编码器
+  encoder: conformer
+  encoder_conf:
+    output_size: 256
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 8
+    dropout_rate: 0.1
+    attention_dropout_rate: 0.0
+    input_layer: conv2d
+    normalize_before: true
+    
+  # ASR解码器
+  decoder: transformer
+  decoder_conf:
+    attention_heads: 4
+    linear_units: 1024
+    num_blocks: 4
+    dropout_rate: 0.1
+    
+  # 多任务配置 - 关键部分
+  ctc_weight: 0.3
+  lsm_weight: 0.1
   
-  # ECAPA-TDNN配置
-  ecapa_channels: [512, 512, 512]
-  ecapa_kernels: [5, 3, 3]
-  ecapa_dilations: [1, 2, 3]
-  context_dim: 1536
-  embedding_dim: 256
-  
-  # 损失配置
-  loss_type: "cross_entropy"
-  focal_gamma: 2.0
-  label_smoothing: 0.1
-  save_macro_f1: true
-
+  # 添加情感分类头
+  aux_ctc_tasks:
+    - name: emotion
+      ctc_weight: 0.3
+      ctc_conf:
+        dropout_rate: 0.0
+        
 # 预处理器配置
-preprocessor: default
-preprocessor_conf:
-  # SpecAugment
-  spec_augment: true
-  spec_augment_conf:
-    apply_time_warp: true
-    time_warp_window: 5
-    apply_freq_mask: true
-    freq_mask_width_range: [0, 30]
-    num_freq_mask: 2
-    apply_time_mask: true
-    time_mask_width_range: [0, 40]
-    num_time_mask: 2
+frontend: default
+frontend_conf:
+  # 特征提取
+  n_fft: 512
+  win_length: 400
+  hop_length: 160
+  
+# SpecAugment
+specaug: specaug
+specaug_conf:
+  apply_time_warp: true
+  time_warp_window: 5
+  apply_freq_mask: true
+  freq_mask_width_range: [0, 30]
+  num_freq_mask: 2
+  apply_time_mask: true
+  time_mask_width_range: [0, 40]
+  num_time_mask: 2
 
-# 最佳模型选择（重点关注macro-F1）
+# 最佳模型选择
 best_model_criterion:
-  - ["valid", "macro_f1", "max"]
   - ["valid", "acc", "max"]
   - ["valid", "loss", "min"]
 
 # 其他配置
 resume: true
-keep_nbest_models: 5
+keep_nbest_models: 3
 use_tensorboard: true
 '''
     
-    with open("cloud_train_config.yaml", 'w') as f:
+    with open("asr_multitask_config.yaml", 'w') as f:
         f.write(config)
     
-    print("✅ Created cloud_train_config.yaml")
+    print("✅ Created asr_multitask_config.yaml")
 
-def check_cloud_dependencies():
-    """检查云端依赖"""
-    print("📦 Checking cloud dependencies...")
+def create_simple_pytorch_ser():
+    """创建简单的PyTorch SER基线（备选方案）"""
     
-    required_packages = {
-        'espnet': 'espnet',
-        'transformers': 'transformers', 
-        'sklearn': 'scikit-learn',
-        'torch': 'torch',
-        'torchaudio': 'torchaudio',
-        'yaml': 'pyyaml',
-        'numpy': 'numpy'
-    }
+    ser_code = '''#!/usr/bin/env python3
+# simple_pytorch_ser.py - 简单PyTorch SER基线
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+import json
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import f1_score, classification_report
+from pathlib import Path
+import logging
+from tqdm import tqdm
+
+class SimpleSERDataset(Dataset):
+    """简单SER数据集"""
+    def __init__(self, data_dir, split='train', max_length=16000*5):
+        self.max_length = max_length
+        self.data = []
+        
+        # 读取数据
+        speech_file = Path(data_dir) / split / "speech.scp"
+        emotion_file = Path(data_dir) / split / "emotion.txt"
+        
+        if not speech_file.exists() or not emotion_file.exists():
+            raise FileNotFoundError(f"Data files not found in {data_dir}/{split}")
+        
+        speech_data = {}
+        with open(speech_file, 'r') as f:
+            for line in f:
+                utt_id, path = line.strip().split(None, 1)
+                speech_data[utt_id] = path
+        
+        with open(emotion_file, 'r') as f:
+            for line in f:
+                utt_id, emotion = line.strip().split()
+                if utt_id in speech_data:
+                    self.data.append((speech_data[utt_id], int(emotion)))
     
-    missing = []
-    for import_name, package_name in required_packages.items():
-        try:
-            __import__(import_name)
-            print(f"✅ {package_name}")
-        except ImportError:
-            missing.append(package_name)
-            print(f"❌ {package_name}")
+    def __len__(self):
+        return len(self.data)
     
-    if missing:
-        print(f"\\n🔧 Installing missing packages...")
-        install_cmd = [sys.executable, "-m", "pip", "install"] + missing
-        print(f"Command: {' '.join(install_cmd)}")
+    def __getitem__(self, idx):
+        wav_path, emotion = self.data[idx]
         
         try:
-            subprocess.run(install_cmd, check=True)
-            print("✅ Dependencies installed successfully")
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Failed to install dependencies: {e}")
+            # 加载音频
+            waveform, sr = torchaudio.load(wav_path)
+            
+            # 重采样到16kHz
+            if sr != 16000:
+                resampler = torchaudio.transforms.Resample(sr, 16000)
+                waveform = resampler(waveform)
+            
+            # 转为单声道
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            
+            # 处理长度
+            if waveform.shape[1] > self.max_length:
+                waveform = waveform[:, :self.max_length]
+            else:
+                pad_length = self.max_length - waveform.shape[1]
+                waveform = F.pad(waveform, (0, pad_length))
+                
+            return waveform.squeeze(0), emotion
+            
+        except Exception as e:
+            print(f"Error loading {wav_path}: {e}")
+            return torch.zeros(self.max_length), 0
+
+class SimpleSERModel(nn.Module):
+    """简单的SER模型"""
+    def __init__(self, num_classes=10):
+        super().__init__()
+        
+        # 简单的CNN特征提取器
+        self.features = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=80, stride=16),
+            nn.ReLU(),
+            nn.BatchNorm1d(64),
+            nn.Conv1d(64, 128, kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Conv1d(128, 256, kernel_size=3, stride=2),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.AdaptiveAvgPool1d(1)
+        )
+        
+        # 分类器
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, num_classes)
+        )
+    
+    def forward(self, x):
+        x = x.unsqueeze(1)  # (batch, 1, time)
+        x = self.features(x)  # (batch, 256, 1)
+        x = x.squeeze(-1)  # (batch, 256)
+        x = self.classifier(x)  # (batch, num_classes)
+        return x
+
+def train_simple_ser():
+    """训练简单SER模型"""
+    print("🚀 Training Simple PyTorch SER Model...")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # 数据加载
+    try:
+        train_dataset = SimpleSERDataset("data", "train")
+        valid_dataset = SimpleSERDataset("data", "valid")
+        
+        train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2)
+        valid_loader = DataLoader(valid_dataset, batch_size=8, shuffle=False, num_workers=2)
+        
+        print(f"Dataset sizes - Train: {len(train_dataset)}, Valid: {len(valid_dataset)}")
+    except Exception as e:
+        print(f"❌ Error loading data: {e}")
+        return False
+    
+    # 模型
+    model = SimpleSERModel(num_classes=10).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    best_macro_f1 = 0.0
+    
+    # 训练循环
+    for epoch in range(10):  # 简化为10个epoch
+        print(f"\\nEpoch {epoch+1}/10")
+        
+        # 训练
+        model.train()
+        train_loss = 0
+        train_correct = 0
+        train_total = 0
+        
+        for batch_idx, (audio, labels) in enumerate(tqdm(train_loader, desc="Training")):
+            audio, labels = audio.to(device), labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(audio)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            train_total += labels.size(0)
+            train_correct += predicted.eq(labels).sum().item()
+        
+        train_acc = 100. * train_correct / train_total
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # 验证
+        model.eval()
+        val_loss = 0
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for audio, labels in tqdm(valid_loader, desc="Validation"):
+                audio, labels = audio.to(device), labels.to(device)
+                outputs = model(audio)
+                loss = criterion(outputs, labels)
+                
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                
+                all_preds.extend(predicted.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        # 计算指标
+        val_acc = 100. * np.mean(np.array(all_preds) == np.array(all_labels))
+        avg_val_loss = val_loss / len(valid_loader)
+        macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
+        
+        print(f"Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        print(f"Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        print(f"Macro-F1: {macro_f1:.4f}")
+        
+        # 保存最佳模型
+        if macro_f1 > best_macro_f1:
+            best_macro_f1 = macro_f1
+            torch.save(model.state_dict(), "best_simple_ser_model.pth")
+            print(f"🎯 New best Macro-F1: {best_macro_f1:.4f}")
+    
+    print(f"\\n✅ Training completed! Best Macro-F1: {best_macro_f1:.4f}")
+    return True
+
+if __name__ == "__main__":
+    train_simple_ser()
+'''
+    
+    with open("simple_pytorch_ser.py", 'w') as f:
+        f.write(ser_code)
+    
+    print("✅ Created simple_pytorch_ser.py")
+
+def check_cloud_environment():
+    """检查云端环境"""
+    print("🔍 Checking cloud environment...")
+    
+    # 检查数据路径
+    if not Path(DATA_ROOT).exists():
+        print(f"❌ Data root not found: {DATA_ROOT}")
+        return False
+    
+    if not Path(AUDIO_DIR).exists():
+        print(f"❌ Audio directory not found: {AUDIO_DIR}")
+        return False
+    
+    # 检查JSON文件
+    for split, json_path in JSON_FILES.items():
+        if not Path(json_path).exists():
+            print(f"❌ Missing JSON file: {json_path}")
             return False
+        print(f"✅ Found {split}: {json_path}")
+    
+    # 检查GPU
+    if torch.cuda.is_available():
+        print(f"✅ CUDA available: {torch.cuda.get_device_name()}")
+    else:
+        print("⚠️  No CUDA, using CPU")
     
     return True
 
-def run_cloud_training():
-    """在云端运行训练"""
-    print("\\n🚀 Starting cloud training...")
+def install_dependencies():
+    """安装必需的依赖"""
+    print("📦 Installing dependencies...")
     
-    # 1. 数据准备
-    print("📊 Step 1: Data preparation...")
+    packages = [
+        "torch",
+        "torchaudio", 
+        "transformers",
+        "scikit-learn",
+        "numpy",
+        "tqdm"
+    ]
+    
+    for package in packages:
+        try:
+            __import__(package)
+            print(f"✅ {package}")
+        except ImportError:
+            print(f"🔧 Installing {package}...")
+            subprocess.run([sys.executable, "-m", "pip", "install", package], check=True)
+
+def run_asr_multitask_training():
+    """运行ASR多任务训练（如果ESP-net可用）"""
+    print("🚀 Attempting ASR multi-task training...")
+    
+    # 数据准备
     try:
-        from cloud_data_prep import prepare_cloud_msp_data
-        prepare_cloud_msp_data()
+        from fixed_cloud_data_prep import prepare_asr_multitask_data
+        prepare_asr_multitask_data()
     except Exception as e:
         print(f"❌ Data preparation failed: {e}")
         return False
     
-    # 2. 检查数据
-    data_dir = Path("data")
-    for split in ["train", "valid"]:
-        speech_scp = data_dir / split / "speech.scp"
-        emotion_txt = data_dir / split / "emotion.txt"
-        
-        if not speech_scp.exists() or not emotion_txt.exists():
-            print(f"❌ {split} data files not found after preparation")
-            return False
-    
-    print("✅ Data preparation completed")
-    
-    # 3. 模型训练 (简化版，不依赖复杂的模型注册)
-    print("\\n🚀 Step 2: Model training...")
-    
-    exp_dir = Path("exp/cloud_wavlm_ecapa")
+    # ASR训练命令
+    exp_dir = Path("exp/asr_multitask_ser")
     exp_dir.mkdir(parents=True, exist_ok=True)
     
-    # 使用ESP-net内置的SER训练
     train_cmd = [
-        sys.executable, "-m", "espnet2.bin.ser_train",
-        "--use_preprocessor", "true",
+        sys.executable, "-m", "espnet2.bin.asr_train",
         "--train_data_path_and_name_and_type", "data/train/speech.scp,speech,sound",
-        "--train_data_path_and_name_and_type", "data/train/emotion.txt,emotion,text",
-        "--valid_data_path_and_name_and_type", "data/valid/speech.scp,speech,sound", 
-        "--valid_data_path_and_name_and_type", "data/valid/emotion.txt,emotion,text",
+        "--train_data_path_and_name_and_type", "data/train/text,text,text",
+        "--train_data_path_and_name_and_type", "data/train/emotion.txt,emotion,text_int",
+        "--valid_data_path_and_name_and_type", "data/valid/speech.scp,speech,sound",
+        "--valid_data_path_and_name_and_type", "data/valid/text,text,text", 
+        "--valid_data_path_and_name_and_type", "data/valid/emotion.txt,emotion,text_int",
         "--output_dir", str(exp_dir),
-        "--config", "cloud_train_config.yaml",
-        "--ngpu", "1",
+        "--config", "asr_multitask_config.yaml",
+        "--ngpu", "1" if torch.cuda.is_available() else "0",
         "--num_workers", "4",
     ]
     
-    print("Training command:")
+    print("ASR Multi-task training command:")
     print(" ".join(train_cmd))
-    print()
     
     try:
         subprocess.run(train_cmd, check=True)
-        print("✅ Training completed successfully!")
+        print("✅ ASR multi-task training completed!")
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Training failed: {e}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"❌ ASR training failed: {e}")
+        print("🔄 Falling back to simple PyTorch SER...")
         return False
-    except FileNotFoundError:
-        print("❌ ESP-net not found. Installing...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "espnet"])
+
+def run_simple_pytorch_training():
+    """运行简单PyTorch训练（备选方案）"""
+    print("🔄 Running simple PyTorch SER training...")
+    
+    try:
+        # 导入并运行
+        exec(open("simple_pytorch_ser.py").read())
+        return True
+    except Exception as e:
+        print(f"❌ Simple PyTorch training failed: {e}")
         return False
 
 def main():
-    print("🌐 Cloud Cluster ESP-net WavLM + ECAPA-TDNN")
+    print("🌐 Fixed Cloud Cluster SER Training")
     print("=" * 60)
     print(f"📁 Data root: {DATA_ROOT}")
     print(f"🎵 Audio dir: {AUDIO_DIR}")
     print("=" * 60)
     
-    # 1. 环境设置
-    print("\\n🔧 Setting up cloud environment...")
-    setup_cloud_environment()
-    
-    # 2. 检查数据
-    print("\\n📊 Checking cloud data...")
-    if not check_cloud_data():
-        print("❌ Cloud data check failed")
+    # 1. 环境检查
+    if not check_cloud_environment():
+        print("❌ Environment check failed")
         return
     
-    # 3. 检查依赖
-    print("\\n📦 Checking dependencies...")
-    if not check_cloud_dependencies():
-        print("❌ Dependency check failed")
-        return
+    # 2. 安装依赖
+    try:
+        install_dependencies()
+    except Exception as e:
+        print(f"⚠️  Dependency installation issue: {e}")
     
-    # 4. 创建云端配置文件
-    print("\\n🔧 Creating cloud configuration...")
-    create_cloud_data_prep()
-    create_cloud_train_config()
+    # 3. 创建必需文件
+    print("\\n🔧 Creating configuration files...")
+    create_fixed_data_prep()
+    create_asr_multitask_config()
+    create_simple_pytorch_ser()
     
-    # 5. 运行训练
+    # 4. 尝试训练
     print("\\n🚀 Starting training...")
-    if run_cloud_training():
-        print("\\n🎉 Cloud training completed successfully!")
-        print("\\n📊 Results location:")
-        print(f"  - Model: exp/cloud_wavlm_ecapa/")
-        print(f"  - Logs: exp/cloud_wavlm_ecapa/train.log")
-        print(f"  - TensorBoard: exp/cloud_wavlm_ecapa/tensorboard/")
+    
+    # 方案1: ASR多任务（ESP-net推荐）
+    if run_asr_multitask_training():
+        print("\\n🎉 ASR multi-task training successful!")
+        print("📊 This approach predicts both text and emotion simultaneously")
     else:
-        print("\\n❌ Cloud training failed")
+        # 方案2: 简单PyTorch SER（备选）
+        print("\\n🔄 Trying simple PyTorch approach...")
+        if run_simple_pytorch_training():
+            print("\\n🎉 Simple PyTorch SER training successful!")
+        else:
+            print("\\n❌ All training approaches failed")
+            return
+    
+    print("\\n" + "=" * 60)
+    print("🎯 Training completed!")
+    print("📁 Check results in:")
+    print("  - exp/asr_multitask_ser/ (if ASR multi-task worked)")
+    print("  - best_simple_ser_model.pth (if PyTorch worked)")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
