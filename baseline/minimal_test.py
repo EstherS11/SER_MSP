@@ -81,11 +81,22 @@ def create_tiny_dataset():
                 wav_path = info['wav']
                 emotion = info['emo']
                 
+                # 处理相对路径
+                if not wav_path.startswith('/'):
+                    if wav_path.startswith('DATA/'):
+                        full_wav_path = os.path.join(DATA_ROOT, wav_path)
+                    else:
+                        full_wav_path = os.path.join(DATA_ROOT, "DATA", "Audios", os.path.basename(wav_path))
+                else:
+                    full_wav_path = wav_path
+                
                 # 检查文件存在且标签有效
-                if os.path.exists(wav_path) and emotion in emotion_map:
-                    scp_f.write(f"{utt_id} {wav_path}\n")
+                if os.path.exists(full_wav_path) and emotion in emotion_map:
+                    scp_f.write(f"{utt_id} {full_wav_path}\n")
                     emo_f.write(f"{utt_id} {emotion_map[emotion]}\n")
                     valid_count += 1
+                else:
+                    print(f"   ⚠️  Skipping {utt_id}: path={wav_path} -> {full_wav_path}, exists={os.path.exists(full_wav_path)}, emotion={emotion}")
         
         print(f"✅ {split}: {valid_count} valid samples")
         total_samples += valid_count
