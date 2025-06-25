@@ -20,6 +20,9 @@ env/
 
 # 模型文件
 models/
+*.pth
+*.pt
+*.h5
 *.pt
 *.ckpt
 *.pkl
