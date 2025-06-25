@@ -87,17 +87,12 @@ def main():
     logging.info("Starting ESP-net SER training...")
     logging.info(f"Arguments: {vars(args)}")
     
-    # 运行SER训练 - 只使用ESP-net，不用fallback
+    # 运行SER训练 - 使用正确的ESP-net调用方式
     try:
         logging.info("Using ESP-net training framework...")
         
-        # 直接调用SER任务的main方法
-        SERTask.main(
-            cmd=sys.argv[1:],
-            parser=parser,
-            args=args,
-            task_class=SERTask,
-        )
+        # 正确的ESP-net调用方式 - 传递解析后的args
+        SERTask.main(args=args)
         
     except Exception as e:
         logging.error(f"ESP-net training failed: {e}")
